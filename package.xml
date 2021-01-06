@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>ar_gripper</name>
+  <version>0.1.0</version>
+  <description>The ARgripper driver package</description>
+  <maintainer email="alex@machinekoder.com">Alexander Rössler</maintainer>
+  <license>BSD</license>
+
+  <url>TODO</url>
+  <author>Alexander Rössler</author>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>python3-serial</depend>
+
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <exec_depend>joy</exec_depend>
+
+  <test_depend>rostest</test_depend>
+  <test_depend>ros_pytest</test_depend>
+  <test_depend>python-pytest-dependency-pip</test_depend>
+
+</package>

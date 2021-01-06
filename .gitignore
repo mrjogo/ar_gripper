@@ -1,0 +1,16 @@
+# Qt
+*.qmlc
+
+# Python
+*.pyc
+
+# pytest
+.coverage
+.cache
+.pytest_cache
+
+# asciidoctor
+.asciidoctor
+
+# setuptools
+/dist/
