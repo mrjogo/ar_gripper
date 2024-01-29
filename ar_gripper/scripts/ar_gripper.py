@@ -166,6 +166,12 @@ class ARGripper:
 
 
 def main():
+    for module in ('ar_gripper.gripper', 'ar_gripper.feetech'):
+        # reconnect logging calls which are children of this to the ros log system
+        logging.getLogger(module).addHandler(ConnectPythonLoggingToROS())
+        # logs sent to children of trigger with a level >= this will be redirected to ROS
+        logging.getLogger(module).setLevel(logging.INFO)
+
     rospy.init_node('ar_gripper')
     rospy.loginfo("ARGripper driver starting")
 
@@ -224,9 +230,4 @@ def main():
 
 
 if __name__ == '__main__':
-    for module in ('ar_gripper.gripper', 'ar_gripper.feetech'):
-        # reconnect logging calls which are children of this to the ros log system
-        logging.getLogger(module).addHandler(ConnectPythonLoggingToROS())
-        # logs sent to children of trigger with a level >= this will be redirected to ROS
-        logging.getLogger(module).setLevel(logging.INFO)
     main()
