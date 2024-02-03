@@ -1,22 +1,22 @@
 import logging
-import rospy
 
 
 class ConnectPythonLoggingToROS(logging.Handler):
-
-    MAP = {
-        logging.DEBUG: rospy.logdebug,
-        logging.INFO: rospy.loginfo,
-        logging.WARNING: rospy.logwarn,
-        logging.ERROR: rospy.logerr,
-        logging.CRITICAL: rospy.logfatal,
-    }
+    def __init__(self, node_logger):
+        super().__init__()
+        self.MAP = {
+            logging.DEBUG: node_logger.debug,
+            logging.INFO: node_logger.info,
+            logging.WARNING: node_logger.warning,
+            logging.ERROR: node_logger.error,
+            logging.CRITICAL: node_logger.fatal,
+        }
 
     def emit(self, record):
         try:
             self.MAP[record.levelno](f"{record.name}: {record.msg}")
         except KeyError:
-            rospy.logerr(
+            self.MAP[logging.ERROR](
                 f"unknown log level {record.levelno} LOG: "
                 f"{record.name}: {record.msg}"
             )
