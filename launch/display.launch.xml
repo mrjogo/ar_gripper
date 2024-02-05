@@ -1,0 +1,16 @@
+<launch>
+
+  <arg name="model" default="$(find-pkg-share ar_gripper)/urdf/ar_gripper_standalone.xacro"/>
+  <arg name="gui" default="true" />
+  <arg name="rvizconfig" default="$(find-pkg-share ar_gripper)/rviz/ar_gripper.rviz" />
+
+  <node name="joint_state_publisher" pkg="joint_state_publisher_gui" exec="joint_state_publisher_gui" if="$(var gui)"/>
+  <node name="joint_state_publisher" pkg="joint_state_publisher" exec="joint_state_publisher" unless="$(var gui)"/>
+
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" exec="robot_state_publisher">
+    <param name="robot_description" value="$(command '$(find-exec xacro) $(var model)')" />
+  </node>
+  <node name="rviz2" pkg="rviz2" exec="rviz2" args="-d $(var rvizconfig)" />
+
+</launch>
