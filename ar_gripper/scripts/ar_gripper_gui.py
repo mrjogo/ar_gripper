@@ -1,17 +1,20 @@
 #!/usr/bin/env python
 
-import rospy
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 import sys
-import signal
+from threading import Thread
 from ar_gripper.interface import ARGripper
 from python_qt_binding.QtWidgets import QMainWindow, QPushButton, QApplication
 from python_qt_binding.QtCore import QTimer
 
 
 class GripperGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, node):
         super().__init__()
-        self.gripper = ARGripper('ar_gripper/main')
+        self._node = node
+        self.gripper = ARGripper("ar_gripper/main", self._node)
 
         self.init_ui()
 
@@ -105,49 +108,62 @@ class GripperGUI(QMainWindow):
         self.show()
 
     def submit_goto1(self):
-        self.gripper.goto_position(0.0, 100)
+        self.gripper.goto_position(0.0, 100.0)
 
     def submit_goto2(self):
-        self.gripper.goto_position(10.0, 100)
+        self.gripper.goto_position(10.0, 100.0)
 
     def submit_goto3(self):
-        self.gripper.goto_position(20.0, 100)
+        self.gripper.goto_position(20.0, 100.0)
 
     def submit_goto4(self):
-        self.gripper.goto_position(30.0, 100)
+        self.gripper.goto_position(30.0, 100.0)
 
     def submit_goto5(self):
-        self.gripper.goto_position(40.0, 100)
+        self.gripper.goto_position(40.0, 100.0)
 
     def submit_goto6(self):
-        self.gripper.goto_position(50.0, 100)
+        self.gripper.goto_position(50.0, 100.0)
 
     def submit_goto7(self):
-        self.gripper.goto_position(60.0, 100)
+        self.gripper.goto_position(60.0, 100.0)
 
     def submit_goto8(self):
-        self.gripper.goto_position(70.0, 100)
+        self.gripper.goto_position(70.0, 100.0)
 
     def submit_goto9(self):
-        self.gripper.goto_position(80.0, 100)
+        self.gripper.goto_position(80.0, 100.0)
 
     def submit_goto10(self):
-        self.gripper.goto_position(90.0, 100)
+        self.gripper.goto_position(90.0, 100.0)
 
     def submit_goto11(self):
-        self.gripper.goto_position(100.0, 100)
+        self.gripper.goto_position(100.0, 100.0)
 
 
 def main():
-    rospy.init_node('ar_gripper_gui')
-    signal.signal(signal.SIGINT, lambda *args: QApplication.quit())
+    rclpy.init(args=sys.argv)
+
     app = QApplication(sys.argv)
     timer = QTimer()
     timer.timeout.connect(lambda: None)
     timer.start(100)
-    _ = GripperGUI()
-    sys.exit(app.exec_())
+
+    ar_gripper_gui_node = Node("ar_gripper_gui")
+    executor = MultiThreadedExecutor()
+    executor.add_node(ar_gripper_gui_node)
+
+    thread = Thread(target=executor.spin)
+    ar_gripper_gui_node.get_logger().info("Starting ROS2 executor thread...")
+    thread.start()
+
+    try:
+        _ = GripperGUI(ar_gripper_gui_node)
+        sys.exit(app.exec_())
+    finally:
+        ar_gripper_gui_node.destroy_node()
+        executor.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
