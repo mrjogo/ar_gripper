@@ -1,0 +1,27 @@
+<launch>
+
+  <arg name="sim" default="false"/>
+
+  <node pkg="ar_gripper" exec="ar_gripper" name="ar_gripper" output="screen" unless="$(var sim)">
+    <param name="port" value="hwgrep://1a86:7523"/>
+    <param name="baud" value="'115200'"/>
+    <param name="grippers" value="'{ &quot;main&quot;: [0] }'" />
+  </node>
+
+  <node pkg="ar_gripper" exec="ar_gripper_sim" name="ar_gripper" output="screen" if="$(var sim)">
+    <param name="grippers" value="'{ &quot;main&quot;: [0] }'" />
+  </node>
+
+  <node pkg="ar_gripper" exec="ar_gripper_gui" name="ar_gripper_gui" output="screen">
+    <param name="grippers" value="[ 'ar_gripper/main' ]" />
+  </node>
+
+  <arg name="model" default="$(find-pkg-share ar_gripper)/urdf/ar_gripper_standalone.xacro"/>
+  <arg name="gui" default="true" />
+  <arg name="rvizconfig" default="$(find-pkg-share ar_gripper)/rviz/ar_gripper.rviz" />
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" exec="robot_state_publisher">
+    <param name="robot_description" value="$(command '$(find-exec xacro) $(var model)')" />
+  </node>
+  <node name="rviz2" pkg="rviz2" exec="rviz2" args="-d $(var rvizconfig)" />
+</launch>
