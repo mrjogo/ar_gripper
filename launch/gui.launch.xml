@@ -1,15 +1,18 @@
 <launch>
 
   <arg name="sim" default="false"/>
+  <!-- Only used when sim=true -->
+  <arg name="external_sim" default="false"/>
 
   <node pkg="ar_gripper" exec="ar_gripper" name="ar_gripper" output="screen" unless="$(var sim)">
     <param name="port" value="hwgrep://1a86:7523"/>
     <param name="baud" value="'115200'"/>
-    <param name="grippers" value="'{ &quot;main&quot;: [0] }'" />
+    <param name="grippers" value="'{ &quot;main&quot;: [1] }'" />
   </node>
 
   <node pkg="ar_gripper" exec="ar_gripper_sim" name="ar_gripper" output="screen" if="$(var sim)">
-    <param name="grippers" value="'{ &quot;main&quot;: [0] }'" />
+    <param name="grippers" value="'{ &quot;main&quot;: [1] }'" />
+    <param name="external_sim" value="$(var external_sim)"/>
   </node>
 
   <node pkg="ar_gripper" exec="ar_gripper_gui" name="ar_gripper_gui" output="screen">
