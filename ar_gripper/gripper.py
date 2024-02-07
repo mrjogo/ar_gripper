@@ -69,9 +69,7 @@ class Gripper:
             servo.reset_current_position()
             servo.goal_position = 4095
             if not self._wait_for_stop(servo):
-                raise CalibrationError(
-                    "calibration failed: home move timed out"
-                )
+                raise CalibrationError("calibration failed: home move timed out")
             tries += 1
 
         retreat_count = 0
@@ -128,8 +126,7 @@ class Gripper:
             return True
 
         servo_position = (
-            self._scale(100.0 - position, self._TOTAL_STEPS)
-            + self._POSITION_MIN
+            self._scale(100.0 - position, self._TOTAL_STEPS) + self._POSITION_MIN
         )
         logger.info(
             "goto position {} {}: servo position {}".format(
@@ -170,7 +167,9 @@ class Gripper:
 
     def _init_servo(self, servo):
         servo.max_torque = self._TORQUE_MAX
-        servo.minimum_startup_force = 5  # minimum force which needs to be applied, before the servo starts to act
+        servo.minimum_startup_force = (
+            5  # minimum force which needs to be applied, before the servo starts to act
+        )
         servo.torque_limit = 100
         servo.overload_torque = 80
         servo.protection_torque = 20
@@ -197,6 +196,8 @@ class Gripper:
             if time.time() - wait_start > timeout:
                 logger.warning("wait for stop timed out")
                 return False
+        # Stop movement if the move was aborted
+        self.halt()
         return False
 
     def _wait_for_no_load(self, servo, timeout=5.0):

@@ -7,7 +7,7 @@ from threading import Lock
 import rclpy
 from rclpy.node import Node
 from rcl_interfaces.msg import ParameterDescriptor
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from std_srvs.srv import Empty
 
@@ -26,27 +26,54 @@ class GripperActionServer:
         self.gripper = gripper
         self._goal_lock = Lock()
         self._commanding_lock = Lock()
-        self._active_goal = None
+        self._goal_handle = None
         self._action_server = ActionServer(
             self._node,
             GripperCommand,
             action_name,
-            self._gripper_action_execute,
+            execute_callback=self._gripper_action_execute,
+            handle_accepted_callback=self._handle_accepted_callback,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
         )
 
-    def _gripper_action_execute(self, goal_handle):
+    def _handle_accepted_callback(self, goal_handle):
         with self._goal_lock:
-            if self._active_goal is not None:
-                self._node.get_logger().info("Aborting gripper goal")
+            # This server only allows one goal at a time
+            if self._goal_handle is not None and self._goal_handle.is_active:
+                self._node.get_logger().info("Aborting previous goal")
                 # If the gripper is in the servoing block, call abort until it finishes
+                rate = self._node.create_rate(50)
                 while not self._commanding_lock.acquire(blocking=False):
                     self.gripper.abort()
+                    rate.sleep()
                 try:
-                    self._active_goal.abort()
+                    self._goal_handle.abort()
                 finally:
                     self._commanding_lock.release()
-            self._active_goal = goal_handle
+            self._goal_handle = goal_handle
+        goal_handle.execute()
 
+    def _goal_callback(self, _goal_request):
+        self._node.get_logger().info("Received goal request")
+        return GoalResponse.ACCEPT
+
+    def _cancel_callback(self, goal):
+        self._node.get_logger().info("Received cancel request")
+        # This may still have a race condition if _gripper_action_execute acquires _goal_lock and
+        # checks goal_handle.is_cancel_requested BEFORE the goal state machine transitions the goal
+        # to CANCELLING, but the result should just be that goal_handle.success() will be called on
+        # a canceled goal.
+        with self._goal_lock:
+            # If the gripper is in the servoing block, call abort until it finishes
+            rate = self._node.create_rate(50)
+            while not self._commanding_lock.acquire(blocking=False):
+                self.gripper.abort()
+                rate.sleep()
+            self._commanding_lock.release()
+            return CancelResponse.ACCEPT
+
+    def _gripper_action_execute(self, goal_handle):
         self._node.get_logger().info(
             f"Execute goal: position={goal_handle.request.command.position:.1f}, "
             f"max_effort={goal_handle.request.command.max_effort:.1f}"
@@ -56,6 +83,11 @@ class GripperActionServer:
             # Needed to prevent an aborted goal from being executed
             if not goal_handle.is_active:
                 self.get_logger().info("Gripper goal aborted")
+                return GripperCommand.Result()
+
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                self._node.get_logger().info("Goal canceled")
                 return GripperCommand.Result()
 
             if goal_handle.request.command.max_effort == 0.0:
@@ -75,6 +107,12 @@ class GripperActionServer:
             if not goal_handle.is_active:
                 self.get_logger().info("Gripper goal aborted")
                 return GripperCommand.Result()
+
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                self._node.get_logger().info("Goal canceled")
+                return GripperCommand.Result()
+
             self._node.get_logger().info(
                 f"{command_msg}: {'done' if succeeded else 'failed'}"
             )
@@ -90,7 +128,7 @@ class GripperActionServer:
             result.stalled = False
             result.reached_goal = succeeded
             goal_handle.succeed()
-            self._active_goal = None
+            self._goal_handle = None
             return result
 
 

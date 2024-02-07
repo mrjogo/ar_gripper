@@ -127,7 +127,7 @@ class Gripper:
 
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
-                    self._node.get_logger().info("Goal cancelled")
+                    self._node.get_logger().info("Goal canceled")
                     return GripperCommand.Result()
                 if self._at_pos:
                     reached = True
@@ -228,7 +228,10 @@ class ARGripperSimNode(Node):
             "external_sim",
             False,
             ParameterDescriptor(
-                description="Whether the gripper is connected to an external simulation, such as Gazebo, or if this node should provide the output",
+                description=(
+                    "Whether the gripper is connected to an external simulation, such as Gazebo, or "
+                    "if this node should provide the output"
+                ),
                 read_only=True,
             ),
         )
