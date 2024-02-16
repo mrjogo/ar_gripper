@@ -13,4 +13,6 @@ ament_python_install_package(${PROJECT_NAME}
   SCRIPTS_DESTINATION lib/${PROJECT_NAME}
 )
 
+ament_environment_hooks("${CMAKE_CURRENT_SOURCE_DIR}/hooks/${PROJECT_NAME}.dsv.in")
+
 ament_package()
