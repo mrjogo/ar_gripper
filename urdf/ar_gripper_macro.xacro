@@ -22,6 +22,10 @@
         </geometry>
         <origin rpy="0.0 0.0 0.0" xyz="0 0 0"/>
       </collision>
+      <inertial>
+        <mass value="0.040" />
+        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+      </inertial>
     </link>
 
     <link name="${prefix}ar_gripper_body">
@@ -39,6 +43,10 @@
         </geometry>
         <origin rpy="0.0 0.0 0.0" xyz="0 0 0"/>
       </collision>
+      <inertial>
+        <mass value="0.400" />
+        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+      </inertial>
     </link>
 
     <link name="${prefix}ar_gripper_finger1">
@@ -57,7 +65,7 @@
         <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
       </collision>
       <inertial>
-        <mass value="100"/>
+        <mass value="0.040"/>
         <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
       </inertial>
     </link>
@@ -78,7 +86,7 @@
         <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
       </collision>
       <inertial>
-        <mass value="100"/>
+        <mass value="0.040"/>
         <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
       </inertial>
     </link>
