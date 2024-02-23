@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<robot name="ar_gripper" xmlns:xacro="http://ros.org/wiki/xacro">
+<robot name="ar_gripper"
+  xmlns:xacro="http://ros.org/wiki/xacro">
   <xacro:macro name="ar_gripper_macro" params="prefix">
 
     <material name="${prefix}Black">
@@ -24,7 +25,8 @@
       </collision>
       <inertial>
         <mass value="0.040" />
-        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+        <!-- These numbers are not correct -->
+        <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
       </inertial>
     </link>
 
@@ -45,7 +47,8 @@
       </collision>
       <inertial>
         <mass value="0.400" />
-        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+        <!-- These numbers are not correct -->
+        <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
       </inertial>
     </link>
 
@@ -54,7 +57,7 @@
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
-        <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
         <material name="${prefix}Black">
         </material>
       </visual>
@@ -62,11 +65,12 @@
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
-        <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
       </collision>
       <inertial>
         <mass value="0.040"/>
-        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+        <!-- These numbers are not correct -->
+        <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
       </inertial>
     </link>
 
@@ -75,7 +79,7 @@
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
-        <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
         <material name="${prefix}Black">
         </material>
       </visual>
@@ -83,11 +87,12 @@
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
-        <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
       </collision>
       <inertial>
         <mass value="0.040"/>
-        <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+        <!-- These numbers are not correct -->
+        <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
       </inertial>
     </link>
 
@@ -96,24 +101,24 @@
       <parent link="${prefix}ar_gripper_adapter"/>
       <child link="${prefix}ar_gripper_body"/>
       <axis xyz="0 0 0"/>
-      <origin rpy="0.0 0.0 0.0" xyz="0 0 0.006"/>
+      <origin rpy="0 0 0" xyz="0 0 0.006"/>
     </joint>
 
     <joint name="${prefix}ar_gripper_body_finger1" type="prismatic">
-      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="1.0"/>
+      <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.02"/>
       <parent link="${prefix}ar_gripper_body"/>
       <child link="${prefix}ar_gripper_finger1"/>
-      <axis xyz="1 0 0"/>
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0 0.0756"/>
+      <axis xyz="-1 0 0"/>
+      <origin rpy="0 0 0" xyz="0.0 0 0.0756"/>
     </joint>
 
     <joint name="${prefix}ar_gripper_body_finger2" type="prismatic">
-      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="1.0"/>
+      <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.02"/>
       <parent link="${prefix}ar_gripper_body"/>
       <child link="${prefix}ar_gripper_finger2"/>
-      <axis xyz="1 0 0"/>
+      <axis xyz="-1 0 0"/>
       <mimic joint="${prefix}ar_gripper_body_finger1" multiplier="1.0" offset="0.0" />
-      <origin rpy="0.0 0.0 ${pi}" xyz="0.0 0 0.0756"/>
+      <origin rpy="0 0 ${pi}" xyz="0.0 0 0.0756"/>
     </joint>
 
   </xacro:macro>

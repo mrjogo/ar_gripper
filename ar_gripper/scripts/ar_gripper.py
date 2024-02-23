@@ -1,41 +1,65 @@
 #!/usr/bin/env python
+import json
 import logging
 import sys
-import json
 from threading import Lock
 
 import rclpy
-from rclpy.node import Node
-from rcl_interfaces.msg import ParameterDescriptor
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
-
-from std_srvs.srv import Empty
-
 from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Empty
 
 from ar_gripper.feetech import USB2FeetechDevice
 from ar_gripper.gripper import Gripper
 from ar_gripper.helpers import ConnectPythonLoggingToROS
 
 
-class GripperActionServer:
-    def __init__(self, action_name, gripper, node):
+class ARGripper:
+    MIN_PERCENT = 0.0
+    MAX_PERCENT = 100.0
+    FINGER_CLOSED_POS = 0.0
+    FINGER_OPEN_POS = 0.05
+    MIN_EFFORT = 0.0
+    # Not exact, but pretty close
+    MAX_EFFORT = 1000.0
+
+    def __init__(self, device, gripper_name, servo_id, node):
+        self._gripper = Gripper(device, gripper_name, servo_id)
         self._node = node
-        self.gripper = gripper
+
+        self._calibrate_srv = self._node.create_service(
+            Empty, f"~/{gripper_name}/calibrate", self._calibrate_srv
+        )
+
         self._goal_lock = Lock()
         self._commanding_lock = Lock()
         self._goal_handle = None
         self._action_server = ActionServer(
             self._node,
             GripperCommand,
-            action_name,
+            f"~/{gripper_name}/gripper_cmd",
             execute_callback=self._gripper_action_execute,
             handle_accepted_callback=self._handle_accepted_callback,
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
         )
+
+        if not self._gripper.calibrate():
+            sys.exit("Gripper calibration failed")
+
+    def _calibrate_srv(self, _request, response):
+        self._node.get_logger().info("Calibrate service: request received")
+        if self._gripper.calibrate():
+            self._node.get_logger().info(
+                "Calibrate service: request successfully completed"
+            )
+        else:
+            self._node.get_logger().info("Calibrate service: calibration failed")
+        return response
 
     def _handle_accepted_callback(self, goal_handle):
         with self._goal_lock:
@@ -45,7 +69,7 @@ class GripperActionServer:
                 # If the gripper is in the servoing block, call abort until it finishes
                 rate = self._node.create_rate(50)
                 while not self._commanding_lock.acquire(blocking=False):
-                    self.gripper.abort()
+                    self._gripper.abort()
                     rate.sleep()
                 try:
                     self._goal_handle.abort()
@@ -60,15 +84,15 @@ class GripperActionServer:
 
     def _cancel_callback(self, goal):
         self._node.get_logger().info("Received cancel request")
-        # This may still have a race condition if _gripper_action_execute acquires _goal_lock and
-        # checks goal_handle.is_cancel_requested BEFORE the goal state machine transitions the goal
-        # to CANCELLING, but the result should just be that goal_handle.success() will be called on
-        # a canceled goal.
+        # This may still have a race condition if _gripper_action_execute acquires
+        # _goal_lock and checks goal_handle.is_cancel_requested BEFORE the goal state
+        # machine transitions the goal to CANCELLING, but the result should just be that
+        # goal_handle.success() will be called on a canceled goal.
         with self._goal_lock:
             # If the gripper is in the servoing block, call abort until it finishes
             rate = self._node.create_rate(50)
             while not self._commanding_lock.acquire(blocking=False):
-                self.gripper.abort()
+                self._gripper.abort()
                 rate.sleep()
             self._commanding_lock.release()
             return CancelResponse.ACCEPT
@@ -90,17 +114,23 @@ class GripperActionServer:
                 self._node.get_logger().info("Goal canceled")
                 return GripperCommand.Result()
 
-            if goal_handle.request.command.max_effort == 0.0:
+            if goal_handle.request.command.max_effort == self.MIN_EFFORT:
                 command_msg = "Release torque"
                 self._node.get_logger().info(f"{command_msg}: start")
-                succeeded = self.gripper.release()
+                succeeded = self._gripper.release()
                 self._node.get_logger().info("Release torque: done")
             else:
                 command_msg = "Go to position"
                 self._node.get_logger().info(f"{command_msg}: start")
-                succeeded = self.gripper.goto_position(
-                    goal_handle.request.command.position,
-                    goal_handle.request.command.max_effort,
+                position_percent = self.stroke_to_percent(
+                    goal_handle.request.command.position
+                )
+                max_effort_percent = self.effort_to_percent(
+                    goal_handle.request.command.max_effort
+                )
+                succeeded = self._gripper.goto_position(
+                    position_percent,
+                    max_effort_percent,
                 )
 
         with self._goal_lock:
@@ -118,12 +148,13 @@ class GripperActionServer:
             )
 
             if not succeeded:
-                self.gripper.halt()
+                self._gripper.halt()
 
             result = GripperCommand.Result()
             # not necessarily the current position of the gripper
             # if the gripper did not reach its goal position.
-            result.position = self.gripper.get_position()
+            position_percent = self._gripper.get_position()
+            result.position = self.percent_to_stroke(position_percent)
             result.effort = goal_handle.request.command.max_effort
             result.stalled = False
             result.reached_goal = succeeded
@@ -131,108 +162,69 @@ class GripperActionServer:
             self._goal_handle = None
             return result
 
+    @classmethod
+    def percent_to_stroke(cls, percent):
+        stroke = cls.FINGER_CLOSED_POS + (
+            cls.MAX_PERCENT - percent
+        ) / cls.MAX_PERCENT * (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
 
-class GripperDiagnostics:
-    def __init__(self, grippers, node):
-        self._node = node
-        self._grippers = grippers
+        # If the input is within range, but the output is not, it's a computation error,
+        # so clamp to min or max. If the input is not, return the raw output.
+        if cls.MIN_PERCENT <= percent <= cls.MAX_PERCENT:
+            if stroke < cls.FINGER_CLOSED_POS:
+                stroke = cls.FINGER_CLOSED_POS
+            elif stroke > cls.FINGER_OPEN_POS:
+                stroke = cls.FINGER_OPEN_POS
 
-        self._pub = self._node.create_publisher(DiagnosticArray, "/diagnostics", 1)
+        return stroke
 
-    def send_diags(self):
-        # See diagnostics with: rosrun rqt_runtime_monitor rqt_runtime_monitor
-        msg = DiagnosticArray()
-        msg.status = []
-        msg.header.stamp = self._node.get_clock().now().to_msg()
+    @classmethod
+    def stroke_to_percent(cls, stroke):
+        percent = cls.MAX_PERCENT - (
+            stroke - cls.FINGER_CLOSED_POS
+        ) * cls.MAX_PERCENT / (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
 
-        for gripper in (g.gripper for g in self._grippers):
-            for servo in [gripper.servo]:
-                status = DiagnosticStatus()
-                status.name = f"Gripper '{gripper.name}' servo {servo.servo_id}"
-                status.hardware_id = f"{servo.servo_id}"
-                temperature = servo.present_temperature
-                status.values.append(
-                    KeyValue(key="Temperature", value=str(temperature))
-                )
-                status.values.append(
-                    KeyValue(key="Voltage", value=str(servo.present_voltage))
-                )
+        # If the input is within range, but the output is not, it's a computation error,
+        # so clamp to min or max. If the input is not, return the raw output.
+        if cls.FINGER_CLOSED_POS <= stroke <= cls.FINGER_OPEN_POS:
+            if percent < cls.MIN_PERCENT:
+                percent = cls.MIN_PERCENT
+            elif percent > cls.MAX_PERCENT:
+                percent = cls.MAX_PERCENT
 
-                if temperature >= 70:
-                    status.level = DiagnosticStatus.ERROR
-                    status.message = "OVERHEATING"
-                elif temperature >= 65:
-                    status.level = DiagnosticStatus.WARN
-                    status.message = "HOT"
-                else:
-                    status.level = DiagnosticStatus.OK
-                    status.message = "OK"
+        return percent
 
-                msg.status.append(status)
-
-        self._pub.publish(msg)
-
-
-class GripperStatus:
-    FINGER_OPEN_POS = -0.05
-    FINGER_CLOSED_POS = 0.0
-
-    def __init__(self, grippers, node):
-        self._node = node
-        self._grippers = grippers
-        self._joint_state_pub = self._node.create_publisher(
-            JointState, "joint_states", 5
-        )
-        self._pos_fb_pubs = {}
-        for gripper in (g.gripper for g in self._grippers):
-            self._pos_fb_pubs[gripper.name] = self._node.create_publisher(
-                JointState, f"~/{gripper.name}/position_feedback", 5
-            )
-
-    def publish_status(self):
-        state_msg = JointState()
-        state_msg.header.stamp = self._node.get_clock().now().to_msg()
-        for gripper in (g.gripper for g in self._grippers):
-            pos = gripper.get_position()
-            joint_pos = self.FINGER_OPEN_POS + (100.0 - pos) / 100.0 * (
-                self.FINGER_CLOSED_POS - self.FINGER_OPEN_POS
-            )
-            state_msg.name.append(f"{gripper.name}_ar_gripper_body_finger1")
-            state_msg.position.append(joint_pos)
-
-            pos_msg = JointState()
-            pos_msg.header.stamp = state_msg.header.stamp
-            pos_msg.name.append("finger1")
-            pos_msg.position.append(pos)
-            self._pos_fb_pubs[gripper.name].publish(pos_msg)
-
-        self._joint_state_pub.publish(state_msg)
-
-
-class ARGripper:
-    def __init__(self, device, gripper_name, servo_id, node):
-        self.gripper = Gripper(device, gripper_name, servo_id)
-
-        self._node = node
-        self._action_srv = GripperActionServer(
-            f"~/{gripper_name}", self.gripper, self._node
-        )
-        self._calibrate_srv = self._node.create_service(
-            Empty, f"~/{gripper_name}/calibrate", self._calibrate_srv
+    @classmethod
+    def percent_to_effort(cls, percent):
+        effort = cls.MIN_EFFORT + (cls.MAX_PERCENT - percent) / cls.MAX_PERCENT * (
+            cls.MAX_EFFORT - cls.MIN_EFFORT
         )
 
-        if not self.gripper.calibrate():
-            sys.exit("Gripper calibration failed")
+        # If the input is within range, but the output is not, it's a computation error,
+        # so clamp to min or max. If the input is not, return the raw output.
+        if cls.MIN_PERCENT <= percent <= cls.MAX_PERCENT:
+            if effort < cls.MIN_EFFORT:
+                effort = cls.MIN_EFFORT
+            elif effort > cls.MAX_EFFORT:
+                effort = cls.MAX_EFFORT
 
-    def _calibrate_srv(self, _request, response):
-        self._node.get_logger().info("Calibrate service: request received")
-        if self.gripper.calibrate():
-            self._node.get_logger().info(
-                "Calibrate service: request successfully completed"
-            )
-        else:
-            self._node.get_logger().info("Calibrate service: calibration failed")
-        return response
+        return effort
+
+    @classmethod
+    def effort_to_percent(cls, effort):
+        percent = cls.MAX_PERCENT - (effort - cls.MIN_EFFORT) * cls.MAX_PERCENT / (
+            cls.MAX_EFFORT - cls.MIN_EFFORT
+        )
+
+        # If the input is within range, but the output is not, it's a computation error,
+        # so clamp to min or max. If the input is not, return the raw output.
+        if cls.MIN_EFFORT <= effort <= cls.MAX_EFFORT:
+            if percent < cls.MIN_PERCENT:
+                percent = cls.MIN_PERCENT
+            elif percent > cls.MAX_PERCENT:
+                percent = cls.MAX_PERCENT
+
+        return percent
 
 
 class ARGripperNode(Node):
@@ -248,7 +240,8 @@ class ARGripperNode(Node):
             logging.getLogger(module).addHandler(
                 ConnectPythonLoggingToROS(self.get_logger())
             )
-            # logs sent to children of trigger with a level >= this will be redirected to ROS
+            # logs sent to children of trigger with a level >= this will be redirected
+            # to ROS
             logging.getLogger(module).setLevel(logging.INFO)
 
         self.get_logger().info("ARGripper driver starting")
@@ -257,7 +250,9 @@ class ARGripperNode(Node):
             "port",
             "/dev/ttyUSB0",
             ParameterDescriptor(
-                description="The port to open communication with the AR Gripper(s) RS-485 bus",
+                description=(
+                    "The port to open communication with the AR Gripper(s) RS-485 bus"
+                ),
                 read_only=True,
             ),
         )
@@ -273,11 +268,14 @@ class ARGripperNode(Node):
             "grippers",
             "{}",
             ParameterDescriptor(
-                description="The parameters for each gripper. See additional_constraints for format",
+                description=(
+                    "The parameters for each gripper. See additional_constraints for "
+                    "format"
+                ),
                 additional_constraints=(
                     'Must be a JSON string in the format {"gripper_1_name_string": '
-                    '[1], "gripper_2_name": [5]}, where the value is the servo RS-485 ID. '
-                    "Currently only one servo ID per gripper is supported"
+                    '[1], "gripper_2_name": [5]}, where the value is the servo RS-485 '
+                    "ID. Currently only one servo ID per gripper is supported"
                 ),
                 read_only=True,
             ),
@@ -285,20 +283,25 @@ class ARGripperNode(Node):
         gripper_params = json.loads(gripper_params_json.value)
 
         self.all_servos = []
-        grippers = []
+        self._grippers = []
 
         device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
         for gripper_name, servo_ids in gripper_params.items():
             if len(servo_ids) != 1:
                 raise ValueError(
-                    f"Only one servo ID per gripper is supported, but gripper '{gripper_name}' has {len(servo_ids)}"
+                    "Only one servo ID per gripper is supported, but gripper "
+                    f"'{gripper_name}' has {len(servo_ids)}"
                 )
             gripper = ARGripper(device, gripper_name, servo_ids[0], self)
             self.all_servos.append(gripper.gripper.servo)
-            grippers.append(gripper)
+            self._grippers.append(gripper)
 
-        self.diagnostics = GripperDiagnostics(grippers, self)
-        self.status = GripperStatus(grippers, self)
+        self._diagnostics_pub = self._node.create_publisher(
+            DiagnosticArray, "/diagnostics", 1
+        )
+        self._joint_state_pub = self._node.create_publisher(
+            JointState, "joint_states", 5
+        )
 
         self.create_timer(self.DIAG_UPDATE_INTERVAL_S, self._send_diagnostics)
         self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self._send_status)
@@ -308,7 +311,37 @@ class ARGripperNode(Node):
 
     def _send_diagnostics(self):
         try:
-            self.diagnostics.send_diags()
+            # See diagnostics with: rosrun rqt_runtime_monitor rqt_runtime_monitor
+            msg = DiagnosticArray()
+            msg.status = []
+            msg.header.stamp = self._node.get_clock().now().to_msg()
+
+            for gripper in (g.gripper for g in self._grippers):
+                for servo in [gripper.servo]:
+                    status = DiagnosticStatus()
+                    status.name = f"Gripper '{gripper.name}' servo {servo.servo_id}"
+                    status.hardware_id = f"{servo.servo_id}"
+                    temperature = servo.present_temperature
+                    status.values.append(
+                        KeyValue(key="Temperature", value=str(temperature))
+                    )
+                    status.values.append(
+                        KeyValue(key="Voltage", value=str(servo.present_voltage))
+                    )
+
+                    if temperature >= 70:
+                        status.level = DiagnosticStatus.ERROR
+                        status.message = "OVERHEATING"
+                    elif temperature >= 65:
+                        status.level = DiagnosticStatus.WARN
+                        status.message = "HOT"
+                    else:
+                        status.level = DiagnosticStatus.OK
+                        status.message = "OK"
+
+                    msg.status.append(status)
+
+            self._pub.publish(msg)
         except Exception as e:
             self.get_logger().error(
                 f"Exception while reading diagnostics: {e}", throttle_duration_sec=5.0
@@ -316,7 +349,15 @@ class ARGripperNode(Node):
 
     def _send_status(self):
         try:
-            self.status.publish_status()
+            state_msg = JointState()
+            state_msg.header.stamp = self._node.get_clock().now().to_msg()
+            for gripper in (g.gripper for g in self._grippers):
+                pos_percent = gripper.get_position()
+                joint_pos = gripper.percent_to_stroke(pos_percent)
+                state_msg.name.append(f"{gripper.name}_ar_gripper_body_finger1")
+                state_msg.position.append(joint_pos)
+
+            self._joint_state_pub.publish(state_msg)
         except Exception as e:
             self.get_logger().error(
                 f"Exception while publishing status {e}", throttle_duration_sec=5.0

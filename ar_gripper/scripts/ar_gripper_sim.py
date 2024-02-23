@@ -1,16 +1,16 @@
 #!/usr/bin/env python
-from collections import defaultdict
+import json
 import sys
 import threading
+from collections import defaultdict
+
 import rclpy
-from rclpy.node import Node
+from control_msgs.action import GripperCommand
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
-import json
-
-from control_msgs.action import GripperCommand
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32
 from std_srvs.srv import Empty
@@ -274,6 +274,9 @@ class ARGripperSimNode(Node):
 
 
 def main():
+    print("DEPRECATED! No longer matches ar_gripper.py.")
+    sys.exit(1)
+
     rclpy.init(args=sys.argv)
 
     try:
