@@ -2,6 +2,7 @@
 import json
 import logging
 import sys
+from math import isclose
 from threading import Lock
 
 import rclpy
@@ -28,7 +29,7 @@ class ARGripper:
     MAX_EFFORT = 1000.0
 
     def __init__(self, device, gripper_name, servo_id, node):
-        self._gripper = Gripper(device, gripper_name, servo_id)
+        self.gripper = Gripper(device, gripper_name, servo_id)
         self._node = node
 
         self._calibrate_srv = self._node.create_service(
@@ -48,12 +49,12 @@ class ARGripper:
             cancel_callback=self._cancel_callback,
         )
 
-        if not self._gripper.calibrate():
+        if not self.gripper.calibrate():
             sys.exit("Gripper calibration failed")
 
     def _calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
-        if self._gripper.calibrate():
+        if self.gripper.calibrate():
             self._node.get_logger().info(
                 "Calibrate service: request successfully completed"
             )
@@ -69,7 +70,7 @@ class ARGripper:
                 # If the gripper is in the servoing block, call abort until it finishes
                 rate = self._node.create_rate(50)
                 while not self._commanding_lock.acquire(blocking=False):
-                    self._gripper.abort()
+                    self.gripper.abort()
                     rate.sleep()
                 try:
                     self._goal_handle.abort()
@@ -92,7 +93,7 @@ class ARGripper:
             # If the gripper is in the servoing block, call abort until it finishes
             rate = self._node.create_rate(50)
             while not self._commanding_lock.acquire(blocking=False):
-                self._gripper.abort()
+                self.gripper.abort()
                 rate.sleep()
             self._commanding_lock.release()
             return CancelResponse.ACCEPT
@@ -117,19 +118,19 @@ class ARGripper:
             if goal_handle.request.command.max_effort == self.MIN_EFFORT:
                 command_msg = "Release torque"
                 self._node.get_logger().info(f"{command_msg}: start")
-                succeeded = self._gripper.release()
+                succeeded = self.gripper.release()
                 self._node.get_logger().info("Release torque: done")
             else:
                 command_msg = "Go to position"
                 self._node.get_logger().info(f"{command_msg}: start")
-                position_percent = self.stroke_to_percent(
+                request_position_percent = self.stroke_to_percent(
                     goal_handle.request.command.position
                 )
                 max_effort_percent = self.effort_to_percent(
                     goal_handle.request.command.max_effort
                 )
-                succeeded = self._gripper.goto_position(
-                    position_percent,
+                succeeded = self.gripper.goto_position(
+                    request_position_percent,
                     max_effort_percent,
                 )
 
@@ -148,25 +149,27 @@ class ARGripper:
             )
 
             if not succeeded:
-                self._gripper.halt()
+                self.gripper.halt()
 
             result = GripperCommand.Result()
             # not necessarily the current position of the gripper
             # if the gripper did not reach its goal position.
-            position_percent = self._gripper.get_position()
-            result.position = self.percent_to_stroke(position_percent)
-            result.effort = goal_handle.request.command.max_effort
-            result.stalled = False
-            result.reached_goal = succeeded
+            result_position_percent = self.gripper.get_position()
+            result.position = self.percent_to_stroke(result_position_percent)
+            result.effort = self.percent_to_effort(self.gripper.get_effort())
+            result.reached_goal = isclose(
+                result.position, goal_handle.request.command.position, abs_tol=0.001
+            )
+            result.stalled = not result.reached_goal and result.effort > 0
             goal_handle.succeed()
             self._goal_handle = None
             return result
 
     @classmethod
     def percent_to_stroke(cls, percent):
-        stroke = cls.FINGER_CLOSED_POS + (
-            cls.MAX_PERCENT - percent
-        ) / cls.MAX_PERCENT * (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
+        stroke = cls.FINGER_CLOSED_POS + (percent - cls.MIN_PERCENT) * (
+            cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS
+        ) / (cls.MAX_PERCENT - cls.MIN_PERCENT)
 
         # If the input is within range, but the output is not, it's a computation error,
         # so clamp to min or max. If the input is not, return the raw output.
@@ -180,9 +183,9 @@ class ARGripper:
 
     @classmethod
     def stroke_to_percent(cls, stroke):
-        percent = cls.MAX_PERCENT - (
-            stroke - cls.FINGER_CLOSED_POS
-        ) * cls.MAX_PERCENT / (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
+        percent = cls.MIN_PERCENT + (stroke - cls.FINGER_CLOSED_POS) * (
+            cls.MAX_PERCENT - cls.MIN_PERCENT
+        ) / (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
 
         # If the input is within range, but the output is not, it's a computation error,
         # so clamp to min or max. If the input is not, return the raw output.
@@ -196,9 +199,9 @@ class ARGripper:
 
     @classmethod
     def percent_to_effort(cls, percent):
-        effort = cls.MIN_EFFORT + (cls.MAX_PERCENT - percent) / cls.MAX_PERCENT * (
+        effort = cls.MIN_EFFORT + (percent - cls.MIN_PERCENT) * (
             cls.MAX_EFFORT - cls.MIN_EFFORT
-        )
+        ) / (cls.MAX_PERCENT - cls.MIN_PERCENT)
 
         # If the input is within range, but the output is not, it's a computation error,
         # so clamp to min or max. If the input is not, return the raw output.
@@ -212,9 +215,9 @@ class ARGripper:
 
     @classmethod
     def effort_to_percent(cls, effort):
-        percent = cls.MAX_PERCENT - (effort - cls.MIN_EFFORT) * cls.MAX_PERCENT / (
-            cls.MAX_EFFORT - cls.MIN_EFFORT
-        )
+        percent = cls.MIN_PERCENT + (effort - cls.MIN_EFFORT) * (
+            cls.MAX_PERCENT - cls.MIN_PERCENT
+        ) / (cls.MAX_EFFORT - cls.MIN_EFFORT)
 
         # If the input is within range, but the output is not, it's a computation error,
         # so clamp to min or max. If the input is not, return the raw output.
@@ -296,12 +299,10 @@ class ARGripperNode(Node):
             self.all_servos.append(gripper.gripper.servo)
             self._grippers.append(gripper)
 
-        self._diagnostics_pub = self._node.create_publisher(
+        self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1
         )
-        self._joint_state_pub = self._node.create_publisher(
-            JointState, "joint_states", 5
-        )
+        self._joint_state_pub = self.create_publisher(JointState, "joint_states", 5)
 
         self.create_timer(self.DIAG_UPDATE_INTERVAL_S, self._send_diagnostics)
         self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self._send_status)
@@ -314,7 +315,7 @@ class ARGripperNode(Node):
             # See diagnostics with: rosrun rqt_runtime_monitor rqt_runtime_monitor
             msg = DiagnosticArray()
             msg.status = []
-            msg.header.stamp = self._node.get_clock().now().to_msg()
+            msg.header.stamp = self.get_clock().now().to_msg()
 
             for gripper in (g.gripper for g in self._grippers):
                 for servo in [gripper.servo]:
@@ -341,7 +342,7 @@ class ARGripperNode(Node):
 
                     msg.status.append(status)
 
-            self._pub.publish(msg)
+            self._diagnostics_pub.publish(msg)
         except Exception as e:
             self.get_logger().error(
                 f"Exception while reading diagnostics: {e}", throttle_duration_sec=5.0
@@ -350,11 +351,11 @@ class ARGripperNode(Node):
     def _send_status(self):
         try:
             state_msg = JointState()
-            state_msg.header.stamp = self._node.get_clock().now().to_msg()
-            for gripper in (g.gripper for g in self._grippers):
-                pos_percent = gripper.get_position()
+            state_msg.header.stamp = self.get_clock().now().to_msg()
+            for gripper in self._grippers:
+                pos_percent = gripper.gripper.get_position()
                 joint_pos = gripper.percent_to_stroke(pos_percent)
-                state_msg.name.append(f"{gripper.name}_ar_gripper_body_finger1")
+                state_msg.name.append(f"{gripper.gripper.name}_ar_gripper_body_finger1")
                 state_msg.position.append(joint_pos)
 
             self._joint_state_pub.publish(state_msg)

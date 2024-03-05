@@ -165,6 +165,9 @@ class Gripper:
     def get_temperature(self):
         return self.servo.present_temperature
 
+    def get_effort(self):
+        return self.servo.present_load
+
     def _init_servo(self, servo):
         servo.max_torque = self._TORQUE_MAX
         servo.minimum_startup_force = (
