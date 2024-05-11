@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+    moveit_simple_controller_manager:
+      controller_names:
+        - ar_gripper
+
+      ar_gripper:
+        action_ns: primary/gripper_cmd
+        type: GripperCommand
+        default: true
+        parallel: true
+        max_effort: 1000.0
+        joints:
+          - primary_ar_gripper_body_finger1
+          - primary_ar_gripper_body_finger2

@@ -1,0 +1,11 @@
+# Used by ros2_control
+controller_manager:
+  ros__parameters:
+    update_rate: 500 # Hz
+
+    ar_gripper:
+      type: position_controllers/GripperActionController
+
+ar_gripper:
+  ros__parameters:
+    joint: primary_ar_gripper_body_finger1

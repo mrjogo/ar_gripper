@@ -6,7 +6,7 @@ find_package(ament_cmake_python REQUIRED)
 
 # Install resource files
 install(DIRECTORY
-  launch meshes rviz urdf
+  launch meshes rviz urdf srdf config
   DESTINATION share/${PROJECT_NAME}/
 )
 ament_python_install_package(${PROJECT_NAME}
