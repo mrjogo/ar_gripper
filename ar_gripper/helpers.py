@@ -20,3 +20,6 @@ class ConnectPythonLoggingToROS(logging.Handler):
                 f"unknown log level {record.levelno} LOG: "
                 f"{record.name}: {record.msg}"
             )
+        except Exception:
+            print("Exception raised while trying to emit Python log to ROS logger: ")
+            print(logging.traceback.format_exc())

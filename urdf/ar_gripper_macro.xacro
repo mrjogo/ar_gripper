@@ -100,7 +100,7 @@
     </joint>
 
     <joint name="${prefix}ar_gripper_body_finger1" type="prismatic">
-      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="1.0"/>
+      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="0.0031"/>
       <parent link="${prefix}ar_gripper_body"/>
       <child link="${prefix}ar_gripper_finger1"/>
       <axis xyz="1 0 0"/>
@@ -108,7 +108,7 @@
     </joint>
 
     <joint name="${prefix}ar_gripper_body_finger2" type="prismatic">
-      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="1.0"/>
+      <limit effort="1000.0" lower="-0.05" upper="0.0" velocity="0.0031"/>
       <parent link="${prefix}ar_gripper_body"/>
       <child link="${prefix}ar_gripper_finger2"/>
       <axis xyz="1 0 0"/>
