@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import json
 import logging
+import os
 import sys
 from math import isclose
 from threading import Lock
@@ -20,6 +21,7 @@ from ar_gripper.helpers import ConnectPythonLoggingToROS
 
 
 class ARGripper:
+    SAVED_POSITION_KEY = "position"
     MIN_PERCENT = 0.0
     MAX_PERCENT = 100.0
     FINGER_CLOSED_POS = 0.0
@@ -28,9 +30,10 @@ class ARGripper:
     # Not exact, but pretty close
     MAX_EFFORT = 1000.0
 
-    def __init__(self, device, gripper_name, servo_id, node):
+    def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
         self.gripper = Gripper(device, gripper_name, servo_id)
         self._node = node
+        self._servo_position_path = servo_position_path
 
         self._calibrate_srv = self._node.create_service(
             Empty, f"~/{gripper_name}/calibrate", self._calibrate_srv
@@ -49,8 +52,26 @@ class ARGripper:
             cancel_callback=self._cancel_callback,
         )
 
-        if not self.gripper.calibrate():
-            sys.exit("Gripper calibration failed")
+        os.makedirs(os.path.dirname(self._servo_position_path), exist_ok=True)
+        previous_position = None
+        try:
+            with open(self._servo_position_path, "r") as f:
+                previous_position = (json.load(f))[self.SAVED_POSITION_KEY]
+        except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError):
+            pass
+
+        if previous_position is None or not self.gripper.verify_calibrated(
+            previous_position
+        ):
+            if not self.gripper.calibrate():
+                sys.exit("Gripper calibration failed")
+            self._save_servo_position()
+        else:
+            self._node.get_logger().info("Using previous gripper calibration")
+
+    def _save_servo_position(self):
+        with open(self._servo_position_path, "w") as f:
+            json.dump({self.SAVED_POSITION_KEY: self.gripper.get_servo_position()}, f)
 
     def _calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
@@ -58,6 +79,7 @@ class ARGripper:
             self._node.get_logger().info(
                 "Calibrate service: request successfully completed"
             )
+            self._save_servo_position()
         else:
             self._node.get_logger().info("Calibrate service: calibration failed")
         return response
@@ -163,6 +185,9 @@ class ARGripper:
             result.stalled = not result.reached_goal and result.effort > 0
             goal_handle.succeed()
             self._goal_handle = None
+
+            # Persist new encoder position
+            self._save_servo_position()
             return result
 
     @classmethod
@@ -284,6 +309,17 @@ class ARGripperNode(Node):
             ),
         )
         gripper_params = json.loads(gripper_params_json.value)
+        servo_position_path = self.declare_parameter(
+            "servo_position_path",
+            "~/.ros/ar_gripper/servo_position.json",
+            ParameterDescriptor(
+                description=(
+                    "The JSON file to store the previous servo position in for "
+                    "checking calibration at startup"
+                ),
+                read_only=True,
+            ),
+        )
 
         self.all_servos = []
         self._grippers = []
@@ -295,7 +331,13 @@ class ARGripperNode(Node):
                     "Only one servo ID per gripper is supported, but gripper "
                     f"'{gripper_name}' has {len(servo_ids)}"
                 )
-            gripper = ARGripper(device, gripper_name, servo_ids[0], self)
+            gripper = ARGripper(
+                device,
+                gripper_name,
+                servo_ids[0],
+                os.path.expanduser(servo_position_path.value),
+                self,
+            )
             self.all_servos.append(gripper.gripper.servo)
             self._grippers.append(gripper)
 

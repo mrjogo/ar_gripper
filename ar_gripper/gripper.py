@@ -43,6 +43,21 @@ class Gripper:
         with self._aborted_lock:
             return self._aborted
 
+    def verify_calibrated(self, previous_position, margin=1):
+        """
+        Rudimentary way to verify that the gripper is still calibrated by checking that
+        the current position is the same as a previously stored position, and assuming
+        that if it is, nothing has been moved and the values are still good.
+
+        :param previous_position: The previous servo position of the gripper
+        :param margin: The acceptable margin (+/- inclusive) to still consider the
+            position same
+        """
+        self._calibrated = (
+            abs(previous_position - self.servo.present_position) <= margin
+        )
+        return self._calibrated
+
     def calibrate(self):
         try:
             self._calibrate()
@@ -112,6 +127,9 @@ class Gripper:
     def get_position(self):
         position = self.servo.present_position - self._POSITION_MIN
         return 100.0 - self._down_scale(position, self._TOTAL_STEPS)
+
+    def get_servo_position(self):
+        return self.servo.present_position
 
     def goto_position(self, position, closing_torque):
         """
