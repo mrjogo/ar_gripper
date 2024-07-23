@@ -706,13 +706,13 @@ class FeetechSMSServo(FeetechServo):
     @property
     def torque_limit(self):
         data = self._read_address(self._TORQUE_LIMIT_ADDR, 2)
-        return int(data[0] | data[1] << 8)
+        return int(data[0] | data[1] << 8) * 0.1
 
     @torque_limit.setter
     def torque_limit(self, value):
-        if not 0.0 <= value <= 1000.0:
+        if not 0.0 <= value <= 100.0:
             raise ValueError("Torque limit must be between 0 and 100%")
-        value = int(value)
+        value = int(value * 10)
         data = [value & 0xFF, value >> 8 & 0xFF]
         self._write_address(self._TORQUE_LIMIT_ADDR, data)
 
