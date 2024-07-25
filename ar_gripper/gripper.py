@@ -1,5 +1,6 @@
 import logging
 import time
+from math import isclose
 from threading import Lock
 
 from ar_gripper.feetech import FeetechSMSServo
@@ -16,12 +17,14 @@ class Gripper:
     _POSITION_MIN = 150  # gripper open
     _TOTAL_STEPS = _POSITION_MAX - _POSITION_MIN
 
-    _TORQUE_MAX = 50  # maximum gripper torque in percent
-    _TORQUE_HOLD = 20  # percentage of torque max
+    # All torques are absolute percentages of the motor stall torque, regardless of what
+    # MAX_TORQUE is set to
+    MAX_TORQUE = 100
+    OVERLOAD_TORQUE = 30
+    HOLDING_TORQUE = 10
+    _CALIBRATION_TORQUE = 10
 
     _WAIT_CHECK_TIME_S = 0.1
-
-    _CALIBRATION_TORQUE = 35
 
     def __init__(self, device, name, servo_id):
         self.name = name
@@ -72,7 +75,7 @@ class Gripper:
         self._calibrated = False
         servo = self.servo
         logger.info(f"calibrating gripper {self.name}")
-        servo.max_torque = self._CALIBRATION_TORQUE
+        servo.torque_limit = self._CALIBRATION_TORQUE
         servo.min_position_limit = 0
         servo.max_position_limit = 4095
         servo.position_correction = 0
@@ -103,7 +106,7 @@ class Gripper:
 
         # move to middle position
         servo.reset_current_position()
-        servo.max_torque = 100
+        self.set_torque(0.5 * self.MAX_TORQUE)
         servo.goal_position = 0
         if not self._wait_for_stop(servo):
             raise CalibrationError(
@@ -121,8 +124,10 @@ class Gripper:
         self._calibrated = True
         logger.info(f"calibrating gripper {self.name} complete")
 
-    def set_max_effort(self, max_effort):
-        self.servo.max_torque = self._scale(max_effort, self._TORQUE_MAX)
+    def set_torque(self, torque):
+        if torque > self.MAX_TORQUE:
+            raise ValueError(f"torque {torque} exceeds max torque {self.MAX_TORQUE}")
+        self.servo.torque_limit = torque
 
     def get_position(self):
         position = self.servo.present_position - self._POSITION_MIN
@@ -131,11 +136,22 @@ class Gripper:
     def get_servo_position(self):
         return self.servo.present_position
 
-    def goto_position(self, position, closing_torque):
+    def goto_position(self, position, closing_torque, holding_torque=None):
         """
         :param position: 0..100%, 0% - close, 100% - open
         :param closing_torque: 0..100%
+        :param holding_torque: 0..100%. Defaults to Gripper.HOLDING_TORQUE
         """
+        if holding_torque is None:
+            holding_torque = self.HOLDING_TORQUE
+        if holding_torque >= self.OVERLOAD_TORQUE:
+            logger.error(
+                "holding torque exceeds or equals overload torque, aborting move"
+            )
+            return False
+        if closing_torque > self.MAX_TORQUE:
+            logger.error("closing torque exceeds max torque, aborting move")
+            return False
         if not self._calibrated:
             logger.error("gripper is not calibrated, aborting move")
             return False
@@ -147,24 +163,15 @@ class Gripper:
             self._scale(100.0 - position, self._TOTAL_STEPS) + self._POSITION_MIN
         )
         logger.info(
-            "goto position {} {}: servo position {}".format(
-                position, closing_torque, servo_position
-            )
+            f"goto position {position} (servo: {servo_position}), closing torque: "
+            f"{closing_torque}, holding torque: {holding_torque}"
         )
-        # essentially sets velocity of movement,
-        # but also sets max_effort for initial half second of grasp.
-        self.set_max_effort(closing_torque)
 
-        if not self._goto_position(servo_position):
+        if not self._goto_position(servo_position, closing_torque, holding_torque):
             if not self._is_aborted():
                 logger.error("goto position failed")
             return False
 
-        # Sets torque to keep gripper in position,
-        # but does not apply torque if there is no load.
-        # This does not provide continuous grasping torque.
-        holding_torque = min(self._TORQUE_HOLD, closing_torque)
-        self.set_max_effort(holding_torque)
         logger.info("goto position done")
         return True
 
@@ -187,16 +194,22 @@ class Gripper:
         return self.servo.present_load
 
     def _init_servo(self, servo):
-        servo.max_torque = self._TORQUE_MAX
-        servo.minimum_startup_force = (
-            5  # minimum force which needs to be applied, before the servo starts to act
-        )
-        servo.torque_limit = 100
-        servo.overload_torque = 80
-        servo.protection_torque = 20
-        servo.protection_time = 0
-        servo.drive_mode = 0
-        servo.drive_speed = 100000
+        if self.OVERLOAD_TORQUE > self.MAX_TORQUE:
+            raise Exception(
+                f"Overload torque {self.OVERLOAD_TORQUE} exceeds max torque "
+                f"{self.MAX_TORQUE}"
+            )
+
+        # Don't do unecessary writes to EPROM
+        self._set_if_different(servo, "minimum_startup_force", 5)
+        self._set_if_different(servo, "max_torque", self.MAX_TORQUE)
+        self._set_if_different(servo, "overload_torque", self.OVERLOAD_TORQUE)
+        self._set_if_different(servo, "protection_torque", 20)
+        self._set_if_different(servo, "protection_time", 300)
+        self._set_if_different(servo, "drive_mode", 0)
+
+        servo.drive_speed = 122500
+        servo.torque_limit = self.MAX_TORQUE
 
     def _wait_for_stop(self, servo, timeout=20.0, stop_delay=3):
         with self._aborted_lock:
@@ -237,10 +250,64 @@ class Gripper:
                 return False
         return False
 
-    def _goto_position(self, position):
+    def _goto_position(self, position, closing_torque, holding_torque):
+        TIMEOUT = 20.0  # seconds
+        INRUSH_TIME = 0.3  # seconds
+        BASELINE_SAMPLES = 4
+        CURRENT_THRESHOLD = 1.4  # multiplier
+        STALL_SAMPLES = 2
+
+        with self._aborted_lock:
+            self._aborted = False
+        # Turn off the torque momentarily to prevent jerking and not apply new torque to
+        # previous position
         self.servo.torque_enable = False
+        # essentially sets velocity of movement,
+        # but also sets max_effort for initial moments of grasp (until stall is detected
+        # and torque drops down to holding_torque)
+        self.set_torque(closing_torque)
+
+        holding_torque_applied = False
+        num_samples = 0
+        current_baseline = 0
+        current_stall_count = 0
+        # Start move
         self.servo.goal_position = position
-        return self._wait_for_stop(self.servo)
+        move_start = time.time()
+        while not self._is_aborted():
+            # Check for timeout
+            if time.time() - move_start > TIMEOUT:
+                logger.error("goto position timed out")
+                break
+            # Wait for initial current spike to subside
+            if time.time() - move_start < INRUSH_TIME:
+                continue
+            current = self.servo.present_current
+            # Accumulate samples to average for baseline
+            if num_samples <= BASELINE_SAMPLES:
+                num_samples += 1
+                current_baseline = (
+                    current_baseline * (num_samples - 1) + current
+                ) / num_samples
+                continue
+            # Once baseline is set, count consecutive samples above threshold
+            if current > current_baseline * CURRENT_THRESHOLD:
+                current_stall_count += 1
+            else:
+                current_stall_count = 0
+            # Apply holding torque if stall is detected or if motion has stopped
+            stopped = not self.servo.moving_sign
+            if not holding_torque_applied and (
+                current_stall_count >= STALL_SAMPLES or stopped
+            ):
+                self.set_torque(holding_torque)
+                holding_torque_applied = True
+
+            if stopped:
+                return True
+        # Stop movement if the move failed or was aborted
+        self.halt()
+        return False
 
     @staticmethod
     def _scale(n, to_max):
@@ -257,3 +324,10 @@ class Gripper:
         result = min(result, 100)
         result = max(result, 0)
         return result
+
+    @staticmethod
+    def _set_if_different(servo, attribute, value):
+        if not isclose(getattr(servo, attribute), value):
+            setattr(servo, attribute, value)
+            return True
+        return False

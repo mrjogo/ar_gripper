@@ -7,6 +7,7 @@ from math import isclose
 from threading import Lock
 
 import rclpy
+from barbot_interfaces.srv import UseFloat64
 from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
@@ -27,16 +28,25 @@ class ARGripper:
     FINGER_CLOSED_POS = 0.0
     FINGER_OPEN_POS = 0.05
     MIN_EFFORT = 0.0
-    # Not exact, but pretty close
-    MAX_EFFORT = 1000.0
+    # Approximate, not accounting for losses
+    # Stall torque x gear radius
+    # (85 kg*cm * 9.8 m/s^2 * 0.01 m/cm) / 0.008 m
+    MAX_EFFORT = 1041.25  # Newtons
+    # For reference, "rated" effort is ~1/3 of stall torque: 347.0833 N
 
     def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
         self.gripper = Gripper(device, gripper_name, servo_id)
         self._node = node
         self._servo_position_path = servo_position_path
+        self._holding_torque = self.gripper.HOLDING_TORQUE
 
         self._calibrate_srv = self._node.create_service(
-            Empty, f"~/{gripper_name}/calibrate", self._calibrate_srv
+            Empty, f"~/{gripper_name}/calibrate", self._handle_calibrate_srv
+        )
+        self._set_holding_torque = self._node.create_service(
+            UseFloat64,
+            f"~/{gripper_name}/set_holding_torque",
+            self._handle_set_holding_torque,
         )
 
         self._goal_lock = Lock()
@@ -73,7 +83,7 @@ class ARGripper:
         with open(self._servo_position_path, "w") as f:
             json.dump({self.SAVED_POSITION_KEY: self.gripper.get_servo_position()}, f)
 
-    def _calibrate_srv(self, _request, response):
+    def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
         if self.gripper.calibrate():
             self._node.get_logger().info(
@@ -82,6 +92,21 @@ class ARGripper:
             self._save_servo_position()
         else:
             self._node.get_logger().info("Calibrate service: calibration failed")
+        return response
+
+    def _handle_set_holding_torque(self, request, response):
+        if request.arg < 0 or request.arg >= self.gripper.OVERLOAD_TORQUE:
+            response.success = False
+            response.msg = (
+                f"Max holding torque {request.arg} must be between 0 and "
+                f"{self.gripper.OVERLOAD_TORQUE}"
+            )
+            self._node.get_logger().error(response.msg)
+            return response
+
+        self._holding_torque = request.arg
+        self._node.get_logger().info(f"Set holding torque to {request.arg}")
+        response.success = True
         return response
 
     def _handle_accepted_callback(self, goal_handle):
@@ -151,9 +176,11 @@ class ARGripper:
                 max_effort_percent = self.effort_to_percent(
                     goal_handle.request.command.max_effort
                 )
+                # Always close "full bore"
                 succeeded = self.gripper.goto_position(
                     request_position_percent,
                     max_effort_percent,
+                    holding_torque=self._holding_torque,
                 )
 
         with self._goal_lock:

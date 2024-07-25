@@ -289,9 +289,12 @@ class FeetechSMSServo(FeetechServo):
     DRIVE_MODE_CONSTANT_SPEED = 1
     DRIVE_MODE_PWM_OPEN_LOOP = 2
 
-    TORQUE_SWITCH_OFF = 0
-    TORQUE_SWITCH_ON = 1
-    TORQUE_SWITCH_MID = 128  # ?? not sure what the manual means
+    TORQUE_ENABLE_OFF = 0
+    TORQUE_ENABLE_ON = 1
+    _TORQUE_SWITCH_SET_MIDPOINT = 128
+
+    WRITE_LOCK_DISABLE = 0
+    WRITE_LOCK_ENABLE = 1
 
     def __init__(self, feetech_device, servo_id, retry_count=3):
         super().__init__(feetech_device, servo_id, retry_count)
@@ -361,9 +364,7 @@ class FeetechSMSServo(FeetechServo):
     @min_position_limit.setter
     def min_position_limit(self, value):
         if not 0 <= value <= 4094:
-            raise ValueError(
-                "Minimum position limit must be between 0 and 4094"
-            )
+            raise ValueError("Minimum position limit must be between 0 and 4094 steps")
         data = [value & 0xFF, value >> 8 & 0xFF]
         self._write_address(self._MIN_POSITION_LIMIT_ADDR, data)
 
@@ -375,9 +376,7 @@ class FeetechSMSServo(FeetechServo):
     @max_position_limit.setter
     def max_position_limit(self, value):
         if not 1 <= value <= 4095:
-            raise ValueError(
-                "Maximum position limit must be between 0 and 4094"
-            )
+            raise ValueError("Maximum position limit must be between 0 and 4094 steps")
         data = [value & 0xFF, value >> 8 & 0xFF]
         self._write_address(self._MAX_POSITION_LIMIT_ADDR, data)
 
@@ -390,7 +389,7 @@ class FeetechSMSServo(FeetechServo):
     def max_temperature_limit(self, value):
         if not 0 <= value <= 100:
             raise ValueError(
-                "Maximum temperature limit must be between 0 and 100"
+                "Maximum temperature limit must be between 0 and 100 degrees celsius"
             )
         data = [value & 0xFF]
         self._write_address(self._MAX_TEMPERATURE_LIMIT_ADDR, data)
@@ -510,7 +509,7 @@ class FeetechSMSServo(FeetechServo):
     @cw_insensitive_zone.setter
     def cw_insensitive_zone(self, value):
         if not 0 <= value <= 32:
-            raise ValueError("CW insensitive zone must be between 0 and 32")
+            raise ValueError("CW insensitive zone must be between 0 and 32 steps")
         self._write_address(self._CW_INSENSITIVE_ZONE_ADDR, [value])
 
     @property
@@ -521,7 +520,7 @@ class FeetechSMSServo(FeetechServo):
     @ccw_insensitive_zone.setter
     def ccw_insensitive_zone(self, value):
         if not 0 <= value <= 32:
-            raise ValueError("CCW insensitive zone must be between 0 and 32")
+            raise ValueError("CCW insensitive zone must be between 0 and 32 steps")
         self._write_address(self._CCW_INSENSITIVE_ZONE_ADDR, [value])
 
     @property
@@ -558,9 +557,7 @@ class FeetechSMSServo(FeetechServo):
     @position_correction.setter
     def position_correction(self, value):
         if not -2047 <= value <= 2047:
-            raise ValueError(
-                "Position correction must be between -2047 and 2047"
-            )
+            raise ValueError("Position correction must be between -2047 and 2047 steps")
         value = int(value)
         sign = 1 if value < -1 else 0
         data = [value & 0xFF, value & 0x7 | sign << 3]
@@ -573,7 +570,11 @@ class FeetechSMSServo(FeetechServo):
 
     @drive_mode.setter
     def drive_mode(self, value):
-        if value not in (0, 1, 2):
+        if value not in (
+            self.DRIVE_MODE_POSITION_SERVO,
+            self.DRIVE_MODE_CONSTANT_SPEED,
+            self.DRIVE_MODE_PWM_OPEN_LOOP,
+        ):
             raise ValueError("Drive mode must be 0, 1 or 2")
         self._write_address(self._DRIVE_MODE_ADDR, [value])
 
@@ -584,6 +585,7 @@ class FeetechSMSServo(FeetechServo):
 
     @protection_torque.setter
     def protection_torque(self, value):
+        # TODO shouldn't this be capped at 100%? Maybe error in datasheet
         if not 0 <= value <= 254:
             raise ValueError("Protection torque must be between 0 and 254%")
         self._write_address(self._PROTECTION_TORQUE_ADDR, [int(value)])
@@ -606,6 +608,7 @@ class FeetechSMSServo(FeetechServo):
 
     @overload_torque.setter
     def overload_torque(self, value):
+        # TODO shouldn't this be capped at 100%? Maybe error in datasheet
         if not 0 <= value <= 254:
             raise ValueError("Overload torque must be between 0 and 254%")
         self._write_address(self._OVERLOAD_TORQUE_ADDR, [int(value)])
@@ -654,6 +657,8 @@ class FeetechSMSServo(FeetechServo):
 
     @torque_enable.setter
     def torque_enable(self, value):
+        if value not in (self.TORQUE_ENABLE_OFF, self.TORQUE_ENABLE_ON):
+            raise ValueError("Torque enable must be 0 or 1")
         self._write_address(self._TORQUE_SWITCH_ADDR, [int(bool(value))])
 
     @property
@@ -694,6 +699,7 @@ class FeetechSMSServo(FeetechServo):
 
     @drive_speed.setter
     def drive_speed(self, value):
+        # TODO 2 bytes, but says max is 254*50. Error in datasheet?
         if not 0 <= value <= 122500:
             raise ValueError("Drive speed must be between 0 and 122500 steps/s")
         value = value // 50
@@ -723,7 +729,7 @@ class FeetechSMSServo(FeetechServo):
 
     @write_lock.setter
     def write_lock(self, value):
-        if value not in (0, 1):
+        if value not in (self.WRITE_LOCK_DISABLE, self.WRITE_LOCK_ENABLE):
             raise ValueError("Write lock must be 0 or 1.")
         self._write_address(self._LOCK_SIGN_ADDR, [int(value)])
 
@@ -747,7 +753,7 @@ class FeetechSMSServo(FeetechServo):
     @property
     def present_voltage(self):
         data = self._read_address(self._PRESENT_VELOCITY_ADDR, 1)
-        return data[0] * 10
+        return data[0] * 0.1
 
     @property
     def present_temperature(self):
@@ -781,7 +787,9 @@ class FeetechSMSServo(FeetechServo):
         """
         Sets current position to 2048.
         """
-        self._write_address(self._TORQUE_SWITCH_ADDR, [128])
+        # The torque switch address is overloaded so when 128 is written to it, instead
+        # of affecting the torque, it resets the current position to 2048.
+        self._write_address(self._TORQUE_SWITCH_ADDR, [self._TORQUE_SWITCH_SET_MIDPOINT])
 
     def flush_all(self):
         self.device.flush()
