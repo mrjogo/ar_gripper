@@ -7,7 +7,7 @@ from math import isclose
 from threading import Lock
 
 import rclpy
-from barbot_interfaces.srv import UseFloat64
+from ar_gripper_interfaces.srv import SetHoldingTorque
 from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
@@ -44,7 +44,7 @@ class ARGripper:
             Empty, f"~/{gripper_name}/calibrate", self._handle_calibrate_srv
         )
         self._set_holding_torque = self._node.create_service(
-            UseFloat64,
+            SetHoldingTorque,
             f"~/{gripper_name}/set_holding_torque",
             self._handle_set_holding_torque,
         )
@@ -95,17 +95,17 @@ class ARGripper:
         return response
 
     def _handle_set_holding_torque(self, request, response):
-        if request.arg < 0 or request.arg >= self.gripper.OVERLOAD_TORQUE:
+        if request.torque < 0 or request.torque >= self.gripper.OVERLOAD_TORQUE:
             response.success = False
             response.msg = (
-                f"Max holding torque {request.arg} must be between 0 and "
+                f"Max holding torque {request.torque} must be between 0 and "
                 f"{self.gripper.OVERLOAD_TORQUE}"
             )
             self._node.get_logger().error(response.msg)
             return response
 
-        self._holding_torque = request.arg
-        self._node.get_logger().info(f"Set holding torque to {request.arg}")
+        self._holding_torque = request.torque
+        self._node.get_logger().info(f"Set holding torque to {request.torque}")
         response.success = True
         return response
 
