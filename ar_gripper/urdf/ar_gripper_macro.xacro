@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <robot name="ar_gripper"
   xmlns:xacro="http://ros.org/wiki/xacro">
-  <xacro:macro name="ar_gripper_macro" params="prefix">
+  <xacro:macro name="ar_gripper" params="tf_prefix">
 
-    <material name="${prefix}Black">
+    <material name="${tf_prefix}Black">
       <color rgba="0.1 0.1 0.1 0.99"/>
     </material>
 
     <!-- link list -->
-    <link name="${prefix}ar_gripper_adapter">
+    <link name="${tf_prefix}ar_gripper_adapter">
       <visual>
         <geometry>
           <mesh filename="package://ar_gripper/meshes/adapter.stl"/>
         </geometry>
         <origin rpy="0.0 0.0 0.0" xyz="0 0 0"/>
-        <material name="${prefix}Black">
+        <material name="${tf_prefix}Black">
         </material>
       </visual>
       <collision>
@@ -30,13 +30,13 @@
       </inertial>
     </link>
 
-    <link name="${prefix}ar_gripper_body">
+    <link name="${tf_prefix}ar_gripper_body">
       <visual>
         <geometry>
           <mesh filename="package://ar_gripper/meshes/body.stl"/>
         </geometry>
         <origin rpy="0.0 0.0 0.0" xyz="0 0 0"/>
-        <material name="${prefix}Black">
+        <material name="${tf_prefix}Black">
         </material>
       </visual>
       <collision>
@@ -52,13 +52,13 @@
       </inertial>
     </link>
 
-    <link name="${prefix}ar_gripper_finger1">
+    <link name="${tf_prefix}ar_gripper_finger1">
       <visual>
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
         <origin rpy="0 0 0" xyz="0 0 0"/>
-        <material name="${prefix}Black">
+        <material name="${tf_prefix}Black">
         </material>
       </visual>
       <collision>
@@ -74,13 +74,13 @@
       </inertial>
     </link>
 
-    <link name="${prefix}ar_gripper_finger2">
+    <link name="${tf_prefix}ar_gripper_finger2">
       <visual>
         <geometry>
           <mesh filename="package://ar_gripper/meshes/finger.stl"/>
         </geometry>
         <origin rpy="0 0 0" xyz="0 0 0"/>
-        <material name="${prefix}Black">
+        <material name="${tf_prefix}Black">
         </material>
       </visual>
       <collision>
@@ -97,27 +97,27 @@
     </link>
 
     <!-- joint list -->
-    <joint name="${prefix}adapter_ar_gripper_body" type="fixed">
-      <parent link="${prefix}ar_gripper_adapter"/>
-      <child link="${prefix}ar_gripper_body"/>
+    <joint name="${tf_prefix}adapter_ar_gripper_body" type="fixed">
+      <parent link="${tf_prefix}ar_gripper_adapter"/>
+      <child link="${tf_prefix}ar_gripper_body"/>
       <axis xyz="0 0 0"/>
       <origin rpy="0 0 0" xyz="0 0 0.006"/>
     </joint>
 
-    <joint name="${prefix}ar_gripper_body_finger1" type="prismatic">
+    <joint name="${tf_prefix}ar_gripper_body_finger1" type="prismatic">
       <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.0031"/>
-      <parent link="${prefix}ar_gripper_body"/>
-      <child link="${prefix}ar_gripper_finger1"/>
+      <parent link="${tf_prefix}ar_gripper_body"/>
+      <child link="${tf_prefix}ar_gripper_finger1"/>
       <axis xyz="-1 0 0"/>
       <origin rpy="0 0 0" xyz="0.0 0 0.0756"/>
     </joint>
 
-    <joint name="${prefix}ar_gripper_body_finger2" type="prismatic">
+    <joint name="${tf_prefix}ar_gripper_body_finger2" type="prismatic">
       <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.0031"/>
-      <parent link="${prefix}ar_gripper_body"/>
-      <child link="${prefix}ar_gripper_finger2"/>
+      <parent link="${tf_prefix}ar_gripper_body"/>
+      <child link="${tf_prefix}ar_gripper_finger2"/>
       <axis xyz="-1 0 0"/>
-      <mimic joint="${prefix}ar_gripper_body_finger1" multiplier="1.0" offset="0.0" />
+      <mimic joint="${tf_prefix}ar_gripper_body_finger1" multiplier="1.0" offset="0.0" />
       <origin rpy="0 0 ${pi}" xyz="0.0 0 0.0756"/>
     </joint>
 

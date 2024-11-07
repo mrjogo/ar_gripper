@@ -4,37 +4,37 @@
   A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
 -->
 <robot xmlns:xacro="http://wiki.ros.org/xacro">
-  <xacro:macro name="ar_gripper_srdf" params="name prefix">
+  <xacro:macro name="ar_gripper_srdf" params="name tf_prefix">
     <!--GROUPS - Representation of a set of joints and links. This can be useful for specifying DOF to plan for, defining arms, end effectors, etc-->
-    <group name="${prefix}${name}ar_gripper">
-      <link name="${prefix}${name}ar_gripper_adapter" />
-      <link name="${prefix}${name}ar_gripper_body" />
-      <link name="${prefix}${name}ar_gripper_finger1" />
-      <link name="${prefix}${name}ar_gripper_finger2" />
-      <joint name="${prefix}${name}ar_gripper_body_finger1" />
-      <passive_joint name="${prefix}${name}ar_gripper_body_finger2" />
+    <group name="${tf_prefix}${name}ar_gripper">
+      <link name="${tf_prefix}${name}ar_gripper_adapter" />
+      <link name="${tf_prefix}${name}ar_gripper_body" />
+      <link name="${tf_prefix}${name}ar_gripper_finger1" />
+      <link name="${tf_prefix}${name}ar_gripper_finger2" />
+      <joint name="${tf_prefix}${name}ar_gripper_body_finger1" />
+      <passive_joint name="${tf_prefix}${name}ar_gripper_body_finger2" />
     </group>
     <!--LINKS - When a link is specified, the parent joint of that link (if it exists) is automatically included-->
     <!--JOINTS - When a joint is specified, the child link of that joint (which will always exist) is automatically included-->
     <!--CHAINS - When a chain is specified, all the links along the chain (including endpoints) are included in the group. Additionally, all the joints that are parents to included links are also included. This means that joints along the chain and the parent joint of the base link are included in the group-->
     <!--SUBGROUPS - Groups can also be formed by referencing to already defined group names-->
     <!--GROUP STATES - Purpose - Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
-    <group_state name="close" group="${prefix}${name}ar_gripper">
-      <joint name="${prefix}${name}ar_gripper_body_finger1" value="0" />
-      <joint name="${prefix}${name}ar_gripper_body_finger2" value="0" />
+    <group_state name="close" group="${tf_prefix}${name}ar_gripper">
+      <joint name="${tf_prefix}${name}ar_gripper_body_finger1" value="0" />
+      <joint name="${tf_prefix}${name}ar_gripper_body_finger2" value="0" />
     </group_state>
-    <group_state name="open" group="${prefix}${name}ar_gripper">
-      <joint name="${prefix}${name}ar_gripper_body_finger1" value="0.05" />
-      <joint name="${prefix}${name}ar_gripper_body_finger2" value="0.05" />
+    <group_state name="open" group="${tf_prefix}${name}ar_gripper">
+      <joint name="${tf_prefix}${name}ar_gripper_body_finger1" value="0.05" />
+      <joint name="${tf_prefix}${name}ar_gripper_body_finger2" value="0.05" />
     </group_state>
     <!--END EFFECTOR - Purpose - Represent information about an end effector.-->
     <!--VIRTUAL JOINT - Purpose - this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
     <!--DISABLE COLLISIONS - By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
-    <disable_collisions link1="${prefix}${name}ar_gripper_adapter" link2="${prefix}${name}ar_gripper_body" reason="Adjacent" />
-    <disable_collisions link1="${prefix}${name}ar_gripper_adapter" link2="${prefix}${name}ar_gripper_finger1" reason="Never" />
-    <disable_collisions link1="${prefix}${name}ar_gripper_adapter" link2="${prefix}${name}ar_gripper_finger2" reason="Never" />
-    <disable_collisions link1="${prefix}${name}ar_gripper_body" link2="${prefix}${name}ar_gripper_finger1" reason="Adjacent" />
-    <disable_collisions link1="${prefix}${name}ar_gripper_body" link2="${prefix}${name}ar_gripper_finger2" reason="Adjacent" />
-    <disable_collisions link1="${prefix}${name}ar_gripper_finger1" link2="${prefix}${name}ar_gripper_finger2" reason="Adjacent" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_adapter" link2="${tf_prefix}${name}ar_gripper_body" reason="Adjacent" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_adapter" link2="${tf_prefix}${name}ar_gripper_finger1" reason="Never" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_adapter" link2="${tf_prefix}${name}ar_gripper_finger2" reason="Never" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_body" link2="${tf_prefix}${name}ar_gripper_finger1" reason="Adjacent" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_body" link2="${tf_prefix}${name}ar_gripper_finger2" reason="Adjacent" />
+    <disable_collisions link1="${tf_prefix}${name}ar_gripper_finger1" link2="${tf_prefix}${name}ar_gripper_finger2" reason="Adjacent" />
   </xacro:macro>
 </robot>
