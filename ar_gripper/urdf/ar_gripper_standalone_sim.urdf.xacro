@@ -1,0 +1,45 @@
+<?xml version="1.0" ?>
+<robot name="za"
+  xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_macro.xacro"/>
+  <xacro:ar_gripper tf_prefix="primary_"/>
+
+  <material name="primary_Red">
+    <color rgba="0.7 0.0 0.0 0.99"/>
+  </material>
+
+  <link name="world"/>
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder length="0.1" radius="0.02"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0.05"/>
+      <material name="primary_Red"/>
+    </visual>
+  </link>
+
+  <joint name="world-base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+  </joint>
+
+  <joint name="base-adapter" type="fixed">
+    <parent link="base_link"/>
+    <child link="primary_ar_gripper_adapter"/>
+    <origin rpy="0 0 0" xyz="0 0 0.1"/>
+  </joint>
+
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_gz.ros2_control.xacro" />
+  <xacro:ar_gripper_ros2_control name="primary" tf_prefix="" />
+
+  <!-- Gazebo -->
+  <gazebo reference="world">
+  </gazebo>
+  <gazebo>
+    <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <parameters>$(find ar_gripper)/config/ar_gripper_sim_controllers.yaml</parameters>
+    </plugin>
+  </gazebo>
+
+</robot>
