@@ -23,9 +23,9 @@
         <state_interface name="effort" />
       </joint>
       <joint name="${tf_prefix}${name}_ar_gripper_body_finger2">
-        <param name="mimic">${tf_prefix}${name}_ar_gripper_body_finger1</param>
-        <param name="multiplier">1</param>
-        <state_interface name="position" />
+        <state_interface name="position">
+          <param name="initial_value">0.03</param>
+        </state_interface>
         <state_interface name="velocity" />
         <state_interface name="effort" />
       </joint>

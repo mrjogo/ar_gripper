@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <robot name="ar_gripper"
   xmlns:xacro="http://ros.org/wiki/xacro">
-  <xacro:macro name="ar_gripper" params="tf_prefix">
+  <xacro:macro name="ar_gripper" params="tf_prefix sim:=false">
+
+    <!-- Workaround for https://github.com/ros-controls/gz_ros2_control/issues/165 -->
+    <xacro:property name="FINGER_LOWER_LIMIT" value="0.0" />
+    <xacro:property name="FINGER_UPPER_LIMIT" value="0.05" />
+    <xacro:property name="FINGER_ADJUSTED_LOWER_LIMIT" value="${FINGER_LOWER_LIMIT - 0.01}" />
+    <xacro:property name="FINGER_ADJUSTED_UPPER_LIMIT" value="${FINGER_UPPER_LIMIT + 0.01}" />
 
     <material name="${tf_prefix}Black">
       <color rgba="0.1 0.1 0.1 0.99"/>
@@ -105,20 +111,22 @@
     </joint>
 
     <joint name="${tf_prefix}ar_gripper_body_finger1" type="prismatic">
-      <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.0031"/>
+      <limit effort="1000.0" lower="${FINGER_ADJUSTED_LOWER_LIMIT}" upper="${FINGER_ADJUSTED_UPPER_LIMIT}" velocity="0.0031"/>
       <parent link="${tf_prefix}ar_gripper_body"/>
       <child link="${tf_prefix}ar_gripper_finger1"/>
       <axis xyz="-1 0 0"/>
       <origin rpy="0 0 0" xyz="0.0 0 0.0756"/>
+      <dynamics damping="0.3" />
     </joint>
 
     <joint name="${tf_prefix}ar_gripper_body_finger2" type="prismatic">
-      <limit effort="1000.0" lower="0.0" upper="0.05" velocity="0.0031"/>
+      <limit effort="1000.0" lower="${FINGER_ADJUSTED_LOWER_LIMIT}" upper="${FINGER_ADJUSTED_UPPER_LIMIT}" velocity="0.0031"/>
       <parent link="${tf_prefix}ar_gripper_body"/>
       <child link="${tf_prefix}ar_gripper_finger2"/>
       <axis xyz="-1 0 0"/>
       <mimic joint="${tf_prefix}ar_gripper_body_finger1" multiplier="1.0" offset="0.0" />
       <origin rpy="0 0 ${pi}" xyz="0.0 0 0.0756"/>
+      <dynamics damping="0.3" />
     </joint>
 
   </xacro:macro>

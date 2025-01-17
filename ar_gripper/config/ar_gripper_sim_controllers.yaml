@@ -9,3 +9,4 @@ controller_manager:
 ar_gripper:
   ros__parameters:
     joint: primary_ar_gripper_body_finger1
+    goal_tolerance: 1.0e-15
