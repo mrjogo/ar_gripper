@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <robot name="ar_gripper"
   xmlns:xacro="http://ros.org/wiki/xacro">
-  <xacro:macro name="ar_gripper" params="tf_prefix parent_link sim:=false">
+  <xacro:macro name="ar_gripper" params="tf_prefix sim:=false">
 
     <!-- Workaround for https://github.com/ros-controls/gz_ros2_control/issues/165 -->
     <xacro:property name="FINGER_LOWER_LIMIT" value="0.0" />
@@ -13,6 +13,8 @@
     <material name="${tf_prefix}Black">
       <color rgba="0.1 0.1 0.1 0.99"/>
     </material>
+
+    <link name="${tf_prefix}ar_gripper_mount" />
 
     <link name="${tf_prefix}ar_gripper_body">
       <visual>
@@ -35,8 +37,8 @@
         <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
       </inertial>
     </link>
-    <joint name="${tf_prefix}ar_gripper_parent_body" type="fixed">
-      <parent link="${parent_link}"/>
+    <joint name="${tf_prefix}ar_gripper_mount_body" type="fixed">
+      <parent link="${tf_prefix}ar_gripper_mount"/>
       <child link="${tf_prefix}ar_gripper_body"/>
       <axis xyz="0 0 0"/>
       <origin rpy="0 0 0" xyz="0 0 0"/>

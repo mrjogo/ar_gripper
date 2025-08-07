@@ -33,9 +33,21 @@
     <origin rpy="0 0 0" xyz="0 0 0.1"/>
   </joint>
 
-  <xacro:ar_gripper_adapter tf_prefix="${tf_prefix}" parent_link="gripper_attachment"/>
-  <!-- Inside whichever adapter is being used -->
-  <xacro:ar_gripper tf_prefix="${tf_prefix}" parent_link="${tf_prefix}ar_gripper_adapter_attachment"/>
+  <xacro:ar_gripper_adapter tf_prefix="${tf_prefix}"/>
+  <joint name="base-ar_gripper_adapter_mount" type="fixed">
+    <parent link="gripper_attachment"/>
+    <child link="${tf_prefix}ar_gripper_adapter_mount"/>
+    <axis xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <xacro:ar_gripper tf_prefix="${tf_prefix}"/>
+  <joint name="adapter_attachment-ar_gripper_mount" type="fixed">
+    <parent link="${tf_prefix}ar_gripper_adapter_attachment"/>
+    <child link="${tf_prefix}ar_gripper_mount"/>
+    <axis xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
 
 
   <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_gz.ros2_control.xacro" />
