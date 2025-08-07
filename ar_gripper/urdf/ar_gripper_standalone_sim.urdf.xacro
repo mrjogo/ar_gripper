@@ -2,33 +2,41 @@
 <robot name="za"
   xmlns:xacro="http://ros.org/wiki/xacro">
   <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_macro.xacro"/>
-  <xacro:ar_gripper tf_prefix="primary_"/>
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_adapter_macro.xacro"/>
 
-  <material name="primary_Red">
+  <xacro:property name="tf_prefix" value="primary_" />
+
+  <material name="${tf_prefix}Red">
     <color rgba="0.7 0.0 0.0 0.99"/>
   </material>
 
   <link name="world"/>
+
   <link name="base_link">
     <visual>
       <geometry>
         <cylinder length="0.1" radius="0.02"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0.05"/>
-      <material name="primary_Red"/>
+      <material name="${tf_prefix}Red"/>
     </visual>
   </link>
-
   <joint name="world-base" type="fixed">
     <parent link="world"/>
     <child link="base_link"/>
   </joint>
 
-  <joint name="base-adapter" type="fixed">
+  <link name="gripper_attachment" />
+  <joint name="base-gripper_attachment" type="fixed">
     <parent link="base_link"/>
-    <child link="primary_ar_gripper_adapter"/>
+    <child link="gripper_attachment"/>
     <origin rpy="0 0 0" xyz="0 0 0.1"/>
   </joint>
+
+  <xacro:ar_gripper_adapter tf_prefix="${tf_prefix}" parent_link="gripper_attachment"/>
+  <!-- Inside whichever adapter is being used -->
+  <xacro:ar_gripper tf_prefix="${tf_prefix}" parent_link="${tf_prefix}ar_gripper_adapter_attachment"/>
+
 
   <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_gz.ros2_control.xacro" />
   <xacro:ar_gripper_ros2_control name="primary" tf_prefix="" />
