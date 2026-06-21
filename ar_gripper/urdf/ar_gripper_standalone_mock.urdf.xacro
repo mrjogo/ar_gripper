@@ -1,0 +1,59 @@
+<?xml version="1.0" ?>
+<!-- Standalone gripper with mock_components/GenericSystem ros2_control (no Gazebo).
+     Parallels ar_gripper_standalone_sim.urdf.xacro but for mock hardware: the joint
+     mirrors commanded position to state with no physics. Used by the mock gripper
+     test (test/test_gripper_mock.launch.py) and usable for standalone mock bring-up. -->
+<robot name="ar_gripper"
+  xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_macro.xacro"/>
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper_adapter_macro.xacro"/>
+
+  <xacro:property name="tf_prefix" value="primary_" />
+
+  <material name="${tf_prefix}Red">
+    <color rgba="0.7 0.0 0.0 0.99"/>
+  </material>
+
+  <link name="world"/>
+
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder length="0.1" radius="0.02"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0.05"/>
+      <material name="${tf_prefix}Red"/>
+    </visual>
+  </link>
+  <joint name="world-base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+  </joint>
+
+  <link name="gripper_attachment" />
+  <joint name="base-gripper_attachment" type="fixed">
+    <parent link="base_link"/>
+    <child link="gripper_attachment"/>
+    <origin rpy="0 0 0" xyz="0 0 0.1"/>
+  </joint>
+
+  <xacro:ar_gripper_adapter tf_prefix="${tf_prefix}"/>
+  <joint name="base-ar_gripper_adapter_mount" type="fixed">
+    <parent link="gripper_attachment"/>
+    <child link="${tf_prefix}ar_gripper_adapter_mount"/>
+    <axis xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <xacro:ar_gripper tf_prefix="${tf_prefix}"/>
+  <joint name="adapter_attachment-ar_gripper_mount" type="fixed">
+    <parent link="${tf_prefix}ar_gripper_adapter_attachment"/>
+    <child link="${tf_prefix}ar_gripper_mount"/>
+    <axis xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <xacro:include filename="$(find ar_gripper)/urdf/ar_gripper.ros2_control.xacro" />
+  <xacro:ar_gripper_mock_ros2_control name="primary" tf_prefix="" />
+
+</robot>
