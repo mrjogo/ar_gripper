@@ -46,11 +46,17 @@ class Gripper:
         with self._aborted_lock:
             return self._aborted
 
-    def verify_calibrated(self, previous_position, margin=1):
+    def verify_calibrated(self, previous_position, margin=200):
         """
         Rudimentary way to verify that the gripper is still calibrated by checking that
         the current position is the same as a previously stored position, and assuming
         that if it is, nothing has been moved and the values are still good.
+
+        The margin absorbs the small drift seen when the software is stopped while an
+        object is grasped (torque relaxes and the finger creeps a few tens of steps).
+        It stays well below the shift caused by removing/reinserting the fingers, so a
+        genuine finger swap still triggers a rehome. 200 steps is ~5% of the ~3945-step
+        finger stroke.
 
         :param previous_position: The previous servo position of the gripper
         :param margin: The acceptable margin (+/- inclusive) to still consider the
