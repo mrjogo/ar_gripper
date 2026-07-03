@@ -13,6 +13,8 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy)
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Empty
 
@@ -371,7 +373,22 @@ class ARGripperNode(Node):
         self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1
         )
-        self._joint_state_pub = self.create_publisher(JointState, "joint_states", 5)
+        # Latch (TRANSIENT_LOCAL) the joint state so late-joining subscribers get
+        # the current gripper angle on connect instead of waiting for the next
+        # update. /joint_states has multiple publishers; rosbridge only latches its
+        # shared subscription when *every* publisher is TRANSIENT_LOCAL, so a
+        # VOLATILE publisher here would silently defeat latching for the whole
+        # topic (e.g. the browser 3D view showing stale turntable/arm poses on
+        # connect). Matches the joint_state_broadcaster and turntable publishers.
+        joint_state_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._joint_state_pub = self.create_publisher(
+            JointState, "joint_states", joint_state_qos
+        )
 
         self.create_timer(self.DIAG_UPDATE_INTERVAL_S, self._send_diagnostics)
         self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self._send_status)
