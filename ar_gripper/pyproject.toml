@@ -1,6 +1,39 @@
-# Tooling config for the ar_gripper package. The package itself builds via
-# ament_cmake (see CMakeLists.txt / package.xml); this file only configures the
-# Python formatters and the hardware-free pytest suite under test/.
+# Tooling + Python packaging for the ar_gripper package.
+#
+# The ROS package builds via ament_cmake (see CMakeLists.txt / package.xml); that
+# path generates its own setup.py in the build dir and reads setup.cfg, so the
+# [build-system]/[project] tables below are inert to colcon. They exist so a
+# NON-ROS consumer (e.g. a LeRobot pipeline) can `uv add` / `pip install` the
+# ROS-free subset -- ARGripperStandalone, the feetech/gripper layers, and the
+# ar_gripper.mock loopback bus -- straight from git:
+#
+#   uv add "git+https://github.com/mrjogo/ar_gripper.git#subdirectory=ar_gripper"
+#   uv add --editable /path/to/ar_gripper/ar_gripper      # local checkout
+#
+# The rclpy-only modules (scripts/, interface.py) are excluded from the wheel.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ar_gripper"
+version = "0.1.0"
+description = "AR gripper driver: ROS-free ARGripperStandalone + Feetech servo layer"
+requires-python = ">=3.10"
+dependencies = ["pyserial"]
+
+[tool.hatch.build.targets.wheel]
+# Ship only the ROS-free modules; scripts/ and interface.py require rclpy. Add
+# new ROS-free modules here so a non-ROS consumer gets them.
+only-include = [
+    "ar_gripper/__init__.py",
+    "ar_gripper/feetech.py",
+    "ar_gripper/gripper.py",
+    "ar_gripper/standalone.py",
+    "ar_gripper/helpers.py",
+    "ar_gripper/mock.py",
+]
 
 [tool.black]
 line-length = 88

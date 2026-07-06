@@ -1,15 +1,46 @@
-"""Hardware-free stand-ins for the Feetech serial bus.
+"""In-memory Feetech bus for hardware-free testing (loopback mock).
 
 Nothing here talks to real hardware. ``FakeServo`` models one Feetech SMS/STS
 servo's register file and the half-duplex packet protocol exactly as
-``ar_gripper.feetech`` speaks it, so the *real* ``feetech``/``gripper`` code runs
-unmodified against an in-memory stand-in. ``FakeSerial`` is the drop-in for the
-object ``serial.serial_for_url`` returns; it records every instruction packet the
-driver writes (``trace``) so tests can assert byte-identical wire behaviour.
+``ar_gripper.feetech`` speaks it, so the *real* ``feetech`` / ``gripper`` /
+``standalone`` code runs unmodified against an in-memory stand-in. ``FakeSerial``
+is the drop-in for the object ``serial.serial_for_url`` returns; it records every
+instruction packet the driver writes (``trace``) for byte-level assertions.
 
-These live in a plain module (not ``conftest``) so both the pytest fixtures and
-the offline golden-capture step can import them.
+This module is ROS-free (only ``pyserial`` + the standard library) and ships in
+the installed package, so an external process — e.g. a LeRobot pipeline that
+consumes ``ARGripperStandalone`` — can loopback-test its gripper integration with
+no hardware and no ROS:
+
+    from ar_gripper.mock import mock_gripper
+
+    with mock_gripper() as (gripper, bus):
+        gripper.close()
+        assert gripper.get_position("ticks") > 4000     # closed
+        gripper.open()
+        assert gripper.get_position("ticks") < 200       # open
+        # bus[-1].trace holds every servo packet that was written
+
+For a fresh homing/calibration run instead of the default "reuse a saved
+position" path, pass ``saved_position=None`` with a ``load_sequence`` that lets
+the homing loop find contact, e.g. ``mock_gripper(saved_position=None,
+load_sequence=[5, 15, 15, 0])``.
+
+Lower-level building blocks (``FakeServo``, ``FakeSerial``, ``FakeTime``,
+``install_fake_serial``, ``loopback_bus``) are exposed for finer control.
 """
+
+from contextlib import contextmanager
+
+__all__ = [
+    "FakeServo",
+    "FakeSerial",
+    "FakeTime",
+    "checksum",
+    "install_fake_serial",
+    "loopback_bus",
+    "mock_gripper",
+]
 
 
 def checksum(values):
@@ -198,7 +229,7 @@ def install_fake_serial(monkeypatch_or_none=None):
 
     Returns ``(created, restore)`` where ``created`` is the growing list of
     FakeSerials (construction order) and ``restore`` puts the real function back.
-    Usable both from pytest (pass a monkeypatch) and offline capture (pass None).
+    Usable both from pytest (pass a monkeypatch) and offline (pass None).
     """
     from ar_gripper import feetech
 
@@ -217,3 +248,87 @@ def install_fake_serial(monkeypatch_or_none=None):
 
     feetech.serial.serial_for_url = factory
     return created, lambda: setattr(feetech.serial, "serial_for_url", original)
+
+
+@contextmanager
+def loopback_bus(fast_clock=True):
+    """Context manager: route ``USB2FeetechDevice`` onto an in-memory FakeServo bus.
+
+    Yields the growing list of ``FakeSerial`` objects (one per device opened while
+    active); ``bus[-1]`` is the most recently opened. With ``fast_clock`` (default)
+    the gripper's wait/servo loops run instantly and deterministically. Restores
+    the real serial factory (and clock) on exit.
+    """
+    created, restore = install_fake_serial(None)
+    original_time = None
+    if fast_clock:
+        from ar_gripper import gripper as _gripper
+
+        original_time = _gripper.time
+        _gripper.time = FakeTime()
+    try:
+        yield created
+    finally:
+        restore()
+        if fast_clock:
+            from ar_gripper import gripper as _gripper
+
+            _gripper.time = original_time
+
+
+@contextmanager
+def mock_gripper(
+    servo_id=0,
+    name="primary",
+    present_position=150,
+    saved_position=150,
+    load_sequence=None,
+    servo_position_path=None,
+    fast_clock=True,
+):
+    """Context manager yielding ``(ARGripperStandalone, FakeSerial)`` on a mock bus.
+
+    The default reuses a saved calibration matching the servo's position (no
+    physical homing), so the gripper comes up calibrated and ready for
+    ``open()`` / ``close()`` / ``set_goal()``. To exercise a fresh homing run,
+    pass ``saved_position=None`` and a ``load_sequence`` the homing loop can find
+    contact in (e.g. ``[5, 15, 15, 0]``). If ``servo_position_path`` is None a
+    temporary file is used and cleaned up.
+    """
+    import json
+    import os
+    import tempfile
+
+    from ar_gripper.feetech import USB2FeetechDevice
+    from ar_gripper.standalone import ARGripperStandalone
+
+    tmp_path = None
+    if servo_position_path is None:
+        fd, servo_position_path = tempfile.mkstemp(
+            prefix="ar_gripper_mock_", suffix=".json"
+        )
+        os.close(fd)
+        tmp_path = servo_position_path
+        if saved_position is None:
+            os.remove(servo_position_path)  # absent file -> forces a rehome
+    if saved_position is not None:
+        with open(servo_position_path, "w") as f:
+            json.dump({"position": saved_position}, f)
+
+    with loopback_bus(fast_clock=fast_clock) as bus:
+        device = USB2FeetechDevice("loopback://")
+        servo = bus[-1].servo(servo_id)
+        servo.present_position_value = present_position
+        if load_sequence is not None:
+            servo.load_sequence = list(load_sequence)
+        gripper = ARGripperStandalone(
+            servo_id=servo_id,
+            name=name,
+            device=device,
+            servo_position_path=servo_position_path,
+        )
+        try:
+            yield gripper, bus[-1]
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.remove(tmp_path)

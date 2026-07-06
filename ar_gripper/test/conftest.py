@@ -1,8 +1,8 @@
 """Pytest fixtures for the hardware-free ar_gripper test suite.
 
-The Feetech bus stand-ins live in ``_fakes`` (importable by the offline
-golden-capture step too). This module only wires them into pytest and puts the
-package source tree on ``sys.path``.
+The Feetech bus stand-ins live in the packaged ``ar_gripper.mock`` module (so
+external consumers can loopback-test too). This module only wires them into
+pytest and puts the package source tree on ``sys.path``.
 
 The package under test lives at ``<repo>/ar_gripper/ar_gripper`` (an ament_cmake
 package, so there is no editable install); we prepend that directory to
@@ -32,7 +32,7 @@ def fake_serials(monkeypatch):
     Yields the list of created FakeSerials in construction order, so a test can
     inspect ``trace`` and configure ``servo(id)`` after building a device.
     """
-    from _fakes import install_fake_serial
+    from ar_gripper.mock import install_fake_serial
 
     created, _restore = install_fake_serial(monkeypatch)
     return created
@@ -41,9 +41,8 @@ def fake_serials(monkeypatch):
 @pytest.fixture
 def fast_clock(monkeypatch):
     """Replace gripper.py's ``time`` with a deterministic fake clock."""
-    from _fakes import FakeTime
-
     from ar_gripper import gripper
+    from ar_gripper.mock import FakeTime
 
     monkeypatch.setattr(gripper, "time", FakeTime())
 

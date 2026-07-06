@@ -18,8 +18,16 @@ The gripper logic is split so it can be driven with or without ROS:
 ## Non-ROS usage
 
 `ARGripperStandalone` needs only `pyserial`, so an external process (e.g. a
-LeRobot imitation-learning pipeline) can import it from a plain venv with this
-package directory on `PYTHONPATH` — no `rclpy`/`ament`/ROS required:
+LeRobot imitation-learning pipeline) can drive the gripper with no
+`rclpy`/`ament`/ROS. Install the ROS-free subset into a plain venv straight from
+git (or a local checkout) — the rclpy-only modules are excluded from the wheel:
+
+```bash
+uv add "git+https://github.com/mrjogo/ar_gripper.git#subdirectory=ar_gripper"
+uv add --editable /path/to/ar_gripper/ar_gripper   # local checkout for dev
+```
+
+Then:
 
 ```python
 from ar_gripper.standalone import ARGripperStandalone
@@ -60,6 +68,27 @@ The RS-485 bus has exactly one owner at a time. The ROS node and an external
 `ar_gripper` node before driving the gripper from another process, and vice
 versa. To share one bus across multiple grippers within a single process, build
 one `USB2FeetechDevice` and inject it via the `device=` argument.
+
+### Loopback testing (no hardware)
+
+`ar_gripper.mock` ships an in-memory Feetech bus, so a consumer can integration-
+test its gripper code against a fake servo — same API, no hardware, no ROS:
+
+```python
+from ar_gripper.mock import mock_gripper
+
+with mock_gripper() as (gripper, bus):
+    gripper.close()
+    assert gripper.get_position("ticks") > 4000   # closed
+    gripper.open()
+    assert gripper.get_position("ticks") < 200      # open
+    # bus.trace holds every servo packet that was written
+```
+
+Pass `saved_position=None, load_sequence=[5, 15, 15, 0]` to exercise a fresh
+homing/calibration run instead of reusing a saved position. Lower-level building
+blocks (`FakeServo`, `FakeSerial`, `loopback_bus`, `install_fake_serial`) are
+exposed for finer control.
 
 ## Tests
 
