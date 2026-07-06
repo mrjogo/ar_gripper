@@ -13,33 +13,45 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
-from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
-                       QoSReliabilityPolicy)
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Empty
 
 from ar_gripper.feetech import USB2FeetechDevice
-from ar_gripper.gripper import Gripper
+from ar_gripper.gripper import CalibrationError
 from ar_gripper.helpers import ConnectPythonLoggingToROS
+from ar_gripper.standalone import ARGripperStandalone
 
 
 class ARGripper:
-    SAVED_POSITION_KEY = "position"
-    MIN_PERCENT = 0.0
-    MAX_PERCENT = 100.0
-    FINGER_CLOSED_POS = 0.0
-    FINGER_OPEN_POS = 0.05
-    MIN_EFFORT = 0.0
-    # Approximate, not accounting for losses
-    # Stall torque x gear radius
-    # (85 kg*cm * 9.8 m/s^2 * 0.01 m/cm) / 0.008 m
-    MAX_EFFORT = 1041.25  # Newtons
-    # For reference, "rated" effort is ~1/3 of stall torque: 347.0833 N
+    """ROS action/service/diagnostics shim over ARGripperStandalone.
+
+    All gripper logic (serial device, grasp state machine, unit maps, calibration
+    persistence) lives in ARGripperStandalone; this class only bridges it to the
+    GripperCommand action, the calibrate / set_holding_torque services, and the
+    node's JointState / diagnostics timers. Behaviour is unchanged vs the
+    pre-shim node: the unit maps and persistence format are shared, not
+    duplicated.
+    """
 
     def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
-        self.gripper = Gripper(device, gripper_name, servo_id)
         self._node = node
-        self._servo_position_path = servo_position_path
+        try:
+            self._standalone = ARGripperStandalone(
+                servo_id=servo_id,
+                name=gripper_name,
+                device=device,
+                servo_position_path=servo_position_path,
+            )
+        except CalibrationError:
+            sys.exit("Gripper calibration failed")
+        # The underlying Gripper is driven directly by the action/diagnostics code.
+        self.gripper = self._standalone.gripper
         self._holding_torque = self.gripper.HOLDING_TORQUE
 
         self._calibrate_srv = self._node.create_service(
@@ -64,34 +76,13 @@ class ARGripper:
             cancel_callback=self._cancel_callback,
         )
 
-        os.makedirs(os.path.dirname(self._servo_position_path), exist_ok=True)
-        previous_position = None
-        try:
-            with open(self._servo_position_path, "r") as f:
-                previous_position = (json.load(f))[self.SAVED_POSITION_KEY]
-        except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError):
-            pass
-
-        if previous_position is None or not self.gripper.verify_calibrated(
-            previous_position
-        ):
-            if not self.gripper.calibrate():
-                sys.exit("Gripper calibration failed")
-            self._save_servo_position()
-        else:
-            self._node.get_logger().info("Using previous gripper calibration")
-
-    def _save_servo_position(self):
-        with open(self._servo_position_path, "w") as f:
-            json.dump({self.SAVED_POSITION_KEY: self.gripper.get_servo_position()}, f)
-
     def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
         if self.gripper.calibrate():
             self._node.get_logger().info(
                 "Calibrate service: request successfully completed"
             )
-            self._save_servo_position()
+            self._standalone.save_position()
         else:
             self._node.get_logger().info("Calibrate service: calibration failed")
         return response
@@ -164,7 +155,7 @@ class ARGripper:
                 self._node.get_logger().info("Goal canceled")
                 return GripperCommand.Result()
 
-            if goal_handle.request.command.max_effort == self.MIN_EFFORT:
+            if goal_handle.request.command.max_effort == ARGripperStandalone.MIN_EFFORT:
                 command_msg = "Release torque"
                 self._node.get_logger().info(f"{command_msg}: start")
                 succeeded = self.gripper.release()
@@ -172,10 +163,10 @@ class ARGripper:
             else:
                 command_msg = "Go to position"
                 self._node.get_logger().info(f"{command_msg}: start")
-                request_position_percent = self.stroke_to_percent(
+                request_position_percent = ARGripperStandalone.stroke_to_percent(
                     goal_handle.request.command.position
                 )
-                max_effort_percent = self.effort_to_percent(
+                max_effort_percent = ARGripperStandalone.effort_to_percent(
                     goal_handle.request.command.max_effort
                 )
                 # Always close "full bore"
@@ -206,8 +197,12 @@ class ARGripper:
             # not necessarily the current position of the gripper
             # if the gripper did not reach its goal position.
             result_position_percent = self.gripper.get_position()
-            result.position = self.percent_to_stroke(result_position_percent)
-            result.effort = self.percent_to_effort(self.gripper.get_effort())
+            result.position = ARGripperStandalone.percent_to_stroke(
+                result_position_percent
+            )
+            result.effort = ARGripperStandalone.percent_to_effort(
+                self.gripper.get_effort()
+            )
             result.reached_goal = isclose(
                 result.position, goal_handle.request.command.position, abs_tol=0.001
             )
@@ -216,72 +211,8 @@ class ARGripper:
             self._goal_handle = None
 
             # Persist new encoder position
-            self._save_servo_position()
+            self._standalone.save_position()
             return result
-
-    @classmethod
-    def percent_to_stroke(cls, percent):
-        stroke = cls.FINGER_CLOSED_POS + (percent - cls.MIN_PERCENT) * (
-            cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS
-        ) / (cls.MAX_PERCENT - cls.MIN_PERCENT)
-
-        # If the input is within range, but the output is not, it's a computation error,
-        # so clamp to min or max. If the input is not, return the raw output.
-        if cls.MIN_PERCENT <= percent <= cls.MAX_PERCENT:
-            if stroke < cls.FINGER_CLOSED_POS:
-                stroke = cls.FINGER_CLOSED_POS
-            elif stroke > cls.FINGER_OPEN_POS:
-                stroke = cls.FINGER_OPEN_POS
-
-        return stroke
-
-    @classmethod
-    def stroke_to_percent(cls, stroke):
-        percent = cls.MIN_PERCENT + (stroke - cls.FINGER_CLOSED_POS) * (
-            cls.MAX_PERCENT - cls.MIN_PERCENT
-        ) / (cls.FINGER_OPEN_POS - cls.FINGER_CLOSED_POS)
-
-        # If the input is within range, but the output is not, it's a computation error,
-        # so clamp to min or max. If the input is not, return the raw output.
-        if cls.FINGER_CLOSED_POS <= stroke <= cls.FINGER_OPEN_POS:
-            if percent < cls.MIN_PERCENT:
-                percent = cls.MIN_PERCENT
-            elif percent > cls.MAX_PERCENT:
-                percent = cls.MAX_PERCENT
-
-        return percent
-
-    @classmethod
-    def percent_to_effort(cls, percent):
-        effort = cls.MIN_EFFORT + (percent - cls.MIN_PERCENT) * (
-            cls.MAX_EFFORT - cls.MIN_EFFORT
-        ) / (cls.MAX_PERCENT - cls.MIN_PERCENT)
-
-        # If the input is within range, but the output is not, it's a computation error,
-        # so clamp to min or max. If the input is not, return the raw output.
-        if cls.MIN_PERCENT <= percent <= cls.MAX_PERCENT:
-            if effort < cls.MIN_EFFORT:
-                effort = cls.MIN_EFFORT
-            elif effort > cls.MAX_EFFORT:
-                effort = cls.MAX_EFFORT
-
-        return effort
-
-    @classmethod
-    def effort_to_percent(cls, effort):
-        percent = cls.MIN_PERCENT + (effort - cls.MIN_EFFORT) * (
-            cls.MAX_PERCENT - cls.MIN_PERCENT
-        ) / (cls.MAX_EFFORT - cls.MIN_EFFORT)
-
-        # If the input is within range, but the output is not, it's a computation error,
-        # so clamp to min or max. If the input is not, return the raw output.
-        if cls.MIN_EFFORT <= effort <= cls.MAX_EFFORT:
-            if percent < cls.MIN_PERCENT:
-                percent = cls.MIN_PERCENT
-            elif percent > cls.MAX_PERCENT:
-                percent = cls.MAX_PERCENT
-
-        return percent
 
 
 class ARGripperNode(Node):
@@ -292,7 +223,11 @@ class ARGripperNode(Node):
     def __init__(self):
         super().__init__("ar_gripper")
 
-        for module in ("ar_gripper.gripper", "ar_gripper.feetech"):
+        for module in (
+            "ar_gripper.gripper",
+            "ar_gripper.feetech",
+            "ar_gripper.standalone",
+        ):
             # reconnect logging calls which are children of this to the ros log system
             logging.getLogger(module).addHandler(
                 ConnectPythonLoggingToROS(self.get_logger())
@@ -440,7 +375,7 @@ class ARGripperNode(Node):
             state_msg.header.stamp = self.get_clock().now().to_msg()
             for gripper in self._grippers:
                 pos_percent = gripper.gripper.get_position()
-                joint_pos = gripper.percent_to_stroke(pos_percent)
+                joint_pos = ARGripperStandalone.percent_to_stroke(pos_percent)
                 state_msg.name.append(f"{gripper.gripper.name}_ar_gripper_body_finger1")
                 state_msg.position.append(joint_pos)
 
