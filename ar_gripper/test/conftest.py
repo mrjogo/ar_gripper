@@ -70,3 +70,52 @@ def make_gripper(fake_serials, fast_clock):
         return gripper, fake
 
     return _make
+
+
+@pytest.fixture
+def make_standalone(fake_serials, fast_clock, tmp_path):
+    """Build an ``ARGripperStandalone`` on a fresh FakeSerial (fast clock).
+
+    A device is built and its servo seeded *before* construction (so calibration
+    load sequences / present position are controllable), then injected — the same
+    injection path the ROS node uses to share one bus across grippers.
+
+    ``saved_position`` seeds the persisted json (``None`` -> no file, forcing a
+    rehome). ``present_position`` seeds the live encoder value. Returns
+    ``(standalone, fake_serial, servo_position_path)``.
+    """
+    import json
+
+    from ar_gripper.feetech import USB2FeetechDevice
+    from ar_gripper.standalone import ARGripperStandalone
+
+    def _make(
+        servo_id=1,
+        name="primary",
+        saved_position=150,
+        present_position=150,
+        load_sequence=None,
+        calibrate_on_init=True,
+        path=None,
+    ):
+        device = USB2FeetechDevice("/dev/fake")
+        fake = fake_serials[-1]
+        servo = fake.servo(servo_id)
+        servo.present_position_value = present_position
+        if load_sequence is not None:
+            servo.load_sequence = list(load_sequence)
+        if path is None:
+            path = tmp_path / "servo_position.json"
+        path = Path(path)
+        if saved_position is not None:
+            path.write_text(json.dumps({"position": saved_position}))
+        standalone = ARGripperStandalone(
+            servo_id=servo_id,
+            name=name,
+            device=device,
+            servo_position_path=str(path),
+            calibrate_on_init=calibrate_on_init,
+        )
+        return standalone, fake, path
+
+    return _make
