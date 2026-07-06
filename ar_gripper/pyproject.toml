@@ -1,0 +1,13 @@
+# Tooling config for the ar_gripper package. The package itself builds via
+# ament_cmake (see CMakeLists.txt / package.xml); this file only configures the
+# Python formatters and the hardware-free pytest suite under test/.
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

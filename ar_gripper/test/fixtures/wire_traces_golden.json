@@ -1,0 +1,121 @@
+{
+  "servo_id": 1,
+  "construct": [
+    "ffff0104020301f4",
+    "ffff0104020501f2",
+    "ffff0104021802de",
+    "ffff0104021002e6",
+    "ffff0104022401d3",
+    "ffff0104022201d5",
+    "ffff0104022301d4",
+    "ffff0104022101d6",
+    "ffff0105032e92092d",
+    "ffff01050330e803db"
+  ],
+  "reads": {
+    "present_position": [
+      "ffff0104023802be"
+    ],
+    "present_load": [
+      "ffff0104023c02ba"
+    ],
+    "present_temperature": [
+      "ffff0104023f01b8"
+    ],
+    "present_voltage": [
+      "ffff0104023a01bd"
+    ],
+    "moving_sign": [
+      "ffff0104024201b5"
+    ]
+  },
+  "ops": {
+    "release": [
+      "ffff0104032800cf"
+    ],
+    "halt": [
+      "ffff0104023802be",
+      "ffff0105032a960036"
+    ],
+    "set_torque_50": [
+      "ffff01050330f401d1"
+    ],
+    "write_goal_2048": [
+      "ffff0105032a0008c4"
+    ],
+    "open": [
+      "ffff0104032800cf",
+      "ffff01050330e803db",
+      "ffff0105032a960036",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024201b5",
+      "ffff01050330640062"
+    ],
+    "goto_50_50": [
+      "ffff0104032800cf",
+      "ffff01050330f401d1",
+      "ffff0105032a4a087a",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024502b1",
+      "ffff0104024201b5",
+      "ffff01050330640062"
+    ],
+    "calibrate": [
+      "ffff01050330640062",
+      "ffff010503090000ed",
+      "ffff0105030bff0fdd",
+      "ffff0105031f0000d7",
+      "ffff0104023c02ba",
+      "ffff01040328804f",
+      "ffff0105032aff0fbe",
+      "ffff0104023802be",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023c02ba",
+      "ffff0104023c02ba",
+      "ffff0104023802be",
+      "ffff0105032acd0ff0",
+      "ffff0104023802be",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023c02ba",
+      "ffff01040328804f",
+      "ffff01050330f401d1",
+      "ffff0105032a0000cc",
+      "ffff0104023802be",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff01040328804f",
+      "ffff0105032a960036",
+      "ffff0104023802be",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff0104023802be",
+      "ffff0104024201b5",
+      "ffff01050309960057"
+    ]
+  }
+}
