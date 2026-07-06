@@ -90,11 +90,17 @@ class ARGripperStandalone:
             os.makedirs(os.path.dirname(self._servo_position_path), exist_ok=True)
 
         if calibrate_on_init:
-            self._startup_calibration()
+            self.run_startup_calibration()
 
     # -- startup calibration / persistence -------------------------------------------
-    def _startup_calibration(self):
-        """Lifted from the ROS node: reuse a valid saved position, else rehome."""
+    def run_startup_calibration(self):
+        """Reuse a valid saved position, else physically rehome and persist.
+
+        Runs automatically from ``__init__`` when ``calibrate_on_init`` is True.
+        Exposed so the ROS node can advertise its action/service endpoints first
+        (matching the pre-shim ordering) and then trigger calibration. Raises
+        ``CalibrationError`` if a required rehome fails.
+        """
         previous_position = self._load_saved_position()
         if previous_position is None or not self.gripper.verify_calibrated(
             previous_position
@@ -187,8 +193,12 @@ class ARGripperStandalone:
             return self.gripper.goto_position(
                 percent, closing_torque, holding_torque=self._holding_torque
             )
+        # Non-blocking: honor exact ticks when the caller gave ticks (the percent
+        # round-trip would quantize them to ~39-tick buckets); otherwise convert
+        # the target percent to ticks.
+        ticks = int(pos) if unit == "ticks" else self._percent_to_ticks(percent)
         self.gripper.set_torque(closing_torque)
-        self.write_goal_ticks(self._percent_to_ticks(percent))
+        self.write_goal_ticks(ticks)
         return None
 
     def write_goal_ticks(self, ticks):

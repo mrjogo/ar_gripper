@@ -134,3 +134,63 @@ def test_diagnostics_overheating(ros_node):
     status = captured[-1].status[0]
     assert status.level == DiagnosticStatus.ERROR
     assert status.message == "OVERHEATING"
+
+
+def _write_params(tmp_path, grippers, saved_position_path):
+    params = tmp_path / "params.yaml"
+    params.write_text(
+        "/**:\n"
+        "  ros__parameters:\n"
+        "    port: /dev/fake\n"
+        '    baud: "115200"\n'
+        f"    grippers: '{grippers}'\n"
+        f"    servo_position_path: {saved_position_path}\n"
+    )
+    return params
+
+
+def test_calibration_failure_exits_process(fake_serials, fast_clock, tmp_path):
+    """A failed startup rehome exits the process with the original message.
+
+    The FakeServo's default present_load (0.0) never reaches the homing contact
+    threshold, so with no saved file to reuse, calibration fails; the shim must
+    translate ARGripperStandalone's CalibrationError into the same sys.exit the
+    pre-shim node used.
+    """
+    import ar_gripper.scripts.ar_gripper as nodemod
+
+    missing = tmp_path / "does_not_exist.json"  # forces a rehome
+    params = _write_params(tmp_path, '{"primary": [1]}', missing)
+    rclpy.init(args=["--ros-args", "--params-file", str(params)])
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            nodemod.ARGripperNode()
+        assert excinfo.value.code == "Gripper calibration failed"
+    finally:
+        rclpy.shutdown()
+
+
+def test_multiple_grippers_share_one_serial_bus(fake_serials, fast_clock, tmp_path):
+    """Two grippers on one bus open exactly one USB2FeetechDevice (shared)."""
+    import ar_gripper.scripts.ar_gripper as nodemod
+
+    saved = tmp_path / "servo_position.json"
+    saved.write_text('{"position": 150}')  # matches FakeServo default -> no rehome
+    params = _write_params(tmp_path, '{"a": [1], "b": [2]}', saved)
+    rclpy.init(args=["--ros-args", "--params-file", str(params)])
+    node = None
+    try:
+        node = nodemod.ARGripperNode()
+        assert len(fake_serials) == 1  # single shared serial device
+        assert len(node._grippers) == 2
+        assert len(node.all_servos) == 2
+        assert sorted(g.gripper.name for g in node._grippers) == ["a", "b"]
+        # Both servos (ids 1 and 2) round-trip over the one bus.
+        captured = []
+        node._diagnostics_pub.publish = lambda msg: captured.append(msg)
+        node._send_diagnostics()
+        assert len(captured[-1].status) == 2
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()

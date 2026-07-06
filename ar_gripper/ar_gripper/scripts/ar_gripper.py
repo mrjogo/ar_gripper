@@ -41,15 +41,16 @@ class ARGripper:
 
     def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
         self._node = node
-        try:
-            self._standalone = ARGripperStandalone(
-                servo_id=servo_id,
-                name=gripper_name,
-                device=device,
-                servo_position_path=servo_position_path,
-            )
-        except CalibrationError:
-            sys.exit("Gripper calibration failed")
+        # Build the standalone WITHOUT calibrating yet, so the action/service
+        # endpoints are advertised before the (potentially blocking) startup
+        # calibration runs -- matching the pre-shim node's ordering.
+        self._standalone = ARGripperStandalone(
+            servo_id=servo_id,
+            name=gripper_name,
+            device=device,
+            servo_position_path=servo_position_path,
+            calibrate_on_init=False,
+        )
         # The underlying Gripper is driven directly by the action/diagnostics code.
         self.gripper = self._standalone.gripper
         self._holding_torque = self.gripper.HOLDING_TORQUE
@@ -75,6 +76,11 @@ class ARGripper:
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
         )
+
+        try:
+            self._standalone.run_startup_calibration()
+        except CalibrationError:
+            sys.exit("Gripper calibration failed")
 
     def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")

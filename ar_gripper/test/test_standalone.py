@@ -202,6 +202,14 @@ def test_set_goal_non_blocking_writes_goal_and_torque(make_standalone):
     assert bytes(fake.servo(SID).reg[0x30:0x32]) == bytes([0xE8, 0x03])
 
 
+@pytest.mark.parametrize("ticks", [2140, 3000, 2000, 300])
+def test_set_goal_non_blocking_ticks_are_exact(make_standalone, ticks):
+    """Non-blocking ticks are written exactly, not quantized through percent."""
+    sa, _fake, _path = make_standalone()
+    sa.set_goal(ticks, unit="ticks", blocking=False)
+    assert sa.get_position("ticks") == ticks
+
+
 def test_close_maps_to_full_close(make_standalone):
     sa, _fake, _path = make_standalone()
     calls = _spy_goto(sa)
