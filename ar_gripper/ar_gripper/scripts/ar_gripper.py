@@ -281,7 +281,7 @@ class ARGripperNode(Node):
         gripper_params = json.loads(gripper_params_json.value)
         servo_position_path = self.declare_parameter(
             "servo_position_path",
-            "~/.ros/ar_gripper/servo_position.json",
+            ARGripperStandalone.DEFAULT_SERVO_POSITION_PATH,
             ParameterDescriptor(
                 description=(
                     "The JSON file to store the previous servo position in for "
