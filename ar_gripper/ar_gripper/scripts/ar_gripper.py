@@ -153,7 +153,7 @@ class ARGripper:
         with self._commanding_lock:
             # Needed to prevent an aborted goal from being executed
             if not goal_handle.is_active:
-                self.get_logger().info("Gripper goal aborted")
+                self._node.get_logger().info("Gripper goal aborted")
                 return GripperCommand.Result()
 
             if goal_handle.is_cancel_requested:
@@ -184,7 +184,7 @@ class ARGripper:
 
         with self._goal_lock:
             if not goal_handle.is_active:
-                self.get_logger().info("Gripper goal aborted")
+                self._node.get_logger().info("Gripper goal aborted")
                 return GripperCommand.Result()
 
             if goal_handle.is_cancel_requested:
@@ -281,7 +281,7 @@ class ARGripperNode(Node):
         gripper_params = json.loads(gripper_params_json.value)
         servo_position_path = self.declare_parameter(
             "servo_position_path",
-            "~/.ros/ar_gripper/servo_position.json",
+            ARGripperStandalone.DEFAULT_SERVO_POSITION_PATH,
             ParameterDescriptor(
                 description=(
                     "The JSON file to store the previous servo position in for "
@@ -291,8 +291,34 @@ class ARGripperNode(Node):
             ),
         )
 
+        mock = self.declare_parameter(
+            "mock",
+            False,
+            ParameterDescriptor(
+                description=(
+                    "Run against an in-process fake Feetech bus instead of real "
+                    "serial hardware, for hardware-free bring-up (simulation / mock "
+                    "e2e). The real driver, action, calibration and diagnostics code "
+                    "all run unchanged -- only the serial servo bus is faked."
+                ),
+                read_only=True,
+            ),
+        ).value
+
         self.all_servos = []
         self._grippers = []
+
+        self._mock_bus = None
+        if mock:
+            # Route every serial device onto an in-process FakeServo bus. Done
+            # before the device opens (USB2FeetechDevice opens serial in __init__).
+            from ar_gripper.mock import install_ros_node_loopback
+
+            self.get_logger().warn(
+                "ARGripper running in MOCK mode: in-process fake Feetech bus "
+                "(no serial hardware)"
+            )
+            self._mock_bus, _ = install_ros_node_loopback()
 
         device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
         for gripper_name, servo_ids in gripper_params.items():
@@ -301,11 +327,21 @@ class ARGripperNode(Node):
                     "Only one servo ID per gripper is supported, but gripper "
                     f"'{gripper_name}' has {len(servo_ids)}"
                 )
+            if mock:
+                # Seed the fake servo so the real startup homing (Gripper.calibrate)
+                # finds contact then retreats, and skip position persistence (path
+                # None) so every mock run rehomes deterministically instead of
+                # trusting a saved real position.
+                from ar_gripper.mock import HOMING_LOAD_SEQUENCE
+
+                self._mock_bus[-1].servo(servo_ids[0]).load_sequence = list(
+                    HOMING_LOAD_SEQUENCE
+                )
             gripper = ARGripper(
                 device,
                 gripper_name,
                 servo_ids[0],
-                os.path.expanduser(servo_position_path.value),
+                None if mock else os.path.expanduser(servo_position_path.value),
                 self,
             )
             self.all_servos.append(gripper.gripper.servo)
@@ -412,10 +448,15 @@ def main():
 
         try:
             executor.spin()
+        except KeyboardInterrupt:
+            pass
         finally:
             ar_gripper_node.destroy_node()
     finally:
-        rclpy.shutdown()
+        # A SIGINT (e.g. launch teardown) may have already shut the context down via
+        # rclpy's signal handling; guard so we don't raise on a double shutdown.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

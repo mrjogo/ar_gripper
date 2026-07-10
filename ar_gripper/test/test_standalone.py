@@ -245,6 +245,29 @@ def test_is_calibrated_reflects_gripper(make_standalone):
 # --------------------------------------------------------------------------- #
 # Level 3: persistence round-trip
 # --------------------------------------------------------------------------- #
+def test_default_servo_position_path_is_the_shared_xdg_state_file():
+    """The default path is one shared file under XDG_STATE_HOME (~/.local/state), so every
+    consumer (ROS node + non-ROS processes) reads/writes one calibration and a fresh process
+    does not rehome just because a different process last used the gripper."""
+    import inspect
+    import os
+
+    from ar_gripper.standalone import ARGripperStandalone
+
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state"
+    )
+    assert ARGripperStandalone.DEFAULT_SERVO_POSITION_PATH == os.path.join(
+        state_home, "ar_gripper", "servo_position.json"
+    )
+    default = (
+        inspect.signature(ARGripperStandalone.__init__)
+        .parameters["servo_position_path"]
+        .default
+    )
+    assert default == ARGripperStandalone.DEFAULT_SERVO_POSITION_PATH
+
+
 def test_avoid_rehome_when_saved_valid(make_standalone):
     """A valid saved position => verify_calibrated passes, no physical rehome."""
     sa, fake, _path = make_standalone(saved_position=150, present_position=150)

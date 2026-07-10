@@ -97,6 +97,24 @@ def test_action_release_result_fields(ros_node):
     assert result.stalled is False
 
 
+def test_aborted_goal_returns_without_crashing(ros_node):
+    """A preempted goal (is_active False on entry) returns cleanly, not AttributeError.
+
+    _handle_accepted_callback aborts an in-flight goal before the new one runs; when
+    the aborted execute callback unblocks it takes the early-return path. Regression:
+    that path logged via self.get_logger(), but ARGripper is a shim (no get_logger) --
+    an AttributeError that killed the action executor. It must use self._node.
+    """
+    node, _fake, _nodemod = ros_node
+    from control_msgs.action import GripperCommand
+
+    handle = _FakeGoalHandle(0.0, 500.0, GripperCommand)
+    handle.is_active = False  # simulate a goal aborted by a newer one
+    result = _gripper(node)._gripper_action_execute(handle)
+    assert isinstance(result, GripperCommand.Result)
+    assert handle.succeeded is False
+
+
 def test_joint_states_publish(ros_node):
     node, fake, _nodemod = ros_node
     fake.servo(SID).present_position_value = 2122  # 50% -> 0.025 m

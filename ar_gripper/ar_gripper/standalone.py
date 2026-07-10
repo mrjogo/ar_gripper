@@ -34,6 +34,17 @@ class ARGripperStandalone:
     """
 
     SAVED_POSITION_KEY = "position"
+    # Shared calibration file, used by BOTH the ROS node and every non-ROS consumer so a
+    # process doesn't force a rehome just because a different process last used the gripper.
+    # (The ROS node declares the same value as its `servo_position_path` parameter default.)
+    # Lives under XDG_STATE_HOME (~/.local/state) — the standard spot for regenerable state
+    # reused on the next run; NOT ~/.config (that's for user-edited config) or ~/.cache
+    # (a cache cleaner wiping it would force an unexpected rehome).
+    DEFAULT_SERVO_POSITION_PATH = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "ar_gripper",
+        "servo_position.json",
+    )
     MIN_PERCENT = 0.0
     MAX_PERCENT = 100.0
     FINGER_CLOSED_POS = 0.0
@@ -51,7 +62,7 @@ class ARGripperStandalone:
         baud=115200,
         servo_id=1,
         name="primary",
-        servo_position_path=None,
+        servo_position_path=DEFAULT_SERVO_POSITION_PATH,
         device=None,
         calibrate_on_init=True,
     ):
@@ -62,8 +73,11 @@ class ARGripperStandalone:
         :param servo_id: Feetech servo RS-485 ID for this gripper.
         :param name: gripper name (used for the joint name / logging).
         :param servo_position_path: JSON file used to remember the last encoder
-            position so a valid saved value can skip a physical rehome. ``None``
-            disables persistence (always rehomes on init, never writes a file).
+            position so a valid saved value can skip a physical rehome. Defaults to
+            ``DEFAULT_SERVO_POSITION_PATH`` (the same file the ROS node uses) so every
+            way of running the gripper shares one calibration and a fresh process does
+            not rehome just because a different process used it. Pass ``None`` to
+            disable persistence (always rehomes on init, never writes a file).
         :param device: an already-open ``USB2FeetechDevice`` to share (the ROS
             node injects one device across all grippers on the bus). When
             ``None`` a new device is opened from ``port``/``baud``.

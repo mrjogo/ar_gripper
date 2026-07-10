@@ -36,11 +36,19 @@ __all__ = [
     "FakeServo",
     "FakeSerial",
     "FakeTime",
+    "HOMING_LOAD_SEQUENCE",
     "checksum",
     "install_fake_serial",
+    "install_ros_node_loopback",
     "loopback_bus",
     "mock_gripper",
 ]
+
+# present_load reads that let Gripper.calibrate()'s homing loop find contact
+# (>= 10) and then retreat until there is no load (0), so a fresh mock startup
+# rehomes deterministically through the *real* calibration routine (mirrors the
+# mock_gripper(saved_position=None, load_sequence=...) example above).
+HOMING_LOAD_SEQUENCE = (5, 15, 15, 0)
 
 
 def checksum(values):
@@ -248,6 +256,41 @@ def install_fake_serial(monkeypatch_or_none=None):
 
     feetech.serial.serial_for_url = factory
     return created, lambda: setattr(feetech.serial, "serial_for_url", original)
+
+
+def install_ros_node_loopback(fast_clock=True):
+    """Route a long-running ARGripper ROS node onto an in-memory FakeServo bus.
+
+    Like ``loopback_bus`` but for a *persistent* process (the ROS node stays
+    mocked for its whole lifetime rather than for a ``with`` block): patches
+    ``serial.serial_for_url`` so every ``USB2FeetechDevice`` opens a
+    ``FakeSerial``, and -- with ``fast_clock`` -- swaps ``gripper.py``'s wait-loop
+    clock for ``FakeTime`` so grasp/homing loops make progress without real delay
+    (and without busy-spinning the node's executor through the inrush wait). This
+    is what lets ``ros2 launch ar_gripper ar_gripper_control.launch.py mock:=true``
+    run the *real* driver / action / calibration / diagnostics code with no
+    hardware. ROS-free (does not import rclpy).
+
+    Returns ``(created, restore)``: ``created`` is the growing list of FakeSerials
+    (one per device opened; ``created[-1]`` is the newest, whose ``servo(id)`` the
+    caller seeds -- e.g. with ``HOMING_LOAD_SEQUENCE`` -- before the gripper
+    calibrates). ``restore`` undoes both patches; the node discards it (staying
+    mocked), tests keep it for teardown.
+    """
+    created, restore_serial = install_fake_serial(None)
+    if not fast_clock:
+        return created, restore_serial
+
+    from ar_gripper import gripper as _gripper
+
+    original_time = _gripper.time
+    _gripper.time = FakeTime()
+
+    def restore():
+        restore_serial()
+        _gripper.time = original_time
+
+    return created, restore
 
 
 @contextmanager
