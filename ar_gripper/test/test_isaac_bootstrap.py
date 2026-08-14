@@ -78,11 +78,11 @@ class _SimPublisher:
     and not an artefact of the stand-in being generous.
     """
 
-    def __init__(self, node):
+    def __init__(self, node, start_position_m=0.019):
         self._clock_pub = node.create_publisher(Clock, "/clock", 10)
         self._state_pub = node.create_publisher(JointState, "/isaac/joint_states", 10)
         node.create_subscription(JointState, COMMAND_TOPIC, self._on_command, 10)
-        self.position_m = 0.019
+        self.position_m = start_position_m
         self.velocity_mps = 0.0
         self._target_m = self.position_m
         self._stop = threading.Event()
@@ -128,10 +128,10 @@ class _SimPublisher:
 
 
 @contextmanager
-def simulator():
+def simulator(start_position_m=0.019):
     """Run the stand-in simulator on its own node and executor."""
     node = rclpy.create_node("test_isaac_sim")
-    publisher = _SimPublisher(node)
+    publisher = _SimPublisher(node, start_position_m=start_position_m)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -208,7 +208,8 @@ def isaac_driver_node():
         gripper_module.time = original_time
 
 
-def test_startup_calibration_completes_inside_the_node_constructor():
+@pytest.mark.parametrize("start_position_m", [OPEN_STOP_M, 0.0259])
+def test_startup_calibration_completes_inside_the_node_constructor(start_position_m):
     """Lets the real startup homing run to completion, with nothing but the
     private executor the isaac branch starts to service the joint-state
     subscription and the ``/clock`` subscription the sim-time driver clock
@@ -217,12 +218,24 @@ def test_startup_calibration_completes_inside_the_node_constructor():
     Remove that executor and this hangs on the first blocking read and then
     fails calibration; the driver's ``sys.exit`` on that path surfaces here as
     ``SystemExit``.
+
+    Run from both ends of the case that used to decide it. Each homing attempt
+    commands 2047 ticks (25.9 mm) of closing from wherever the finger is, so
+    how far it overshoots the stop -- all an error threshold can see -- depends
+    on where it started. From the fully open stop, which is *where homing
+    itself leaves the finger*, so this is what a driver restart does, the
+    second attempt overshoots by only 1.9 mm; from 0.0259 m the first attempt
+    lands on the stop with essentially no overshoot at all, which is the
+    smallest it can be. Within the stroke those are the two ends of it.
     """
     from ar_gripper import gripper as gripper_module
 
     rclpy.init()
     try:
-        with simulator(), isaac_driver_node() as node:
+        with (
+            simulator(start_position_m=start_position_m),
+            isaac_driver_node() as node,
+        ):
             assert node._grippers[0].gripper.calibrated is True
             # Sim time, not wall time: the driver's clock is the simulator
             # node's clock, and it only advances because /clock is published

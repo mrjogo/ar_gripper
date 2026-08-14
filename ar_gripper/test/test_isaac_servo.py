@@ -30,6 +30,10 @@ from xml.etree import ElementTree
 import pytest
 from ar_gripper.scripts.isaac_servo import (
     _DRIVE_SPEED_ADDR,
+    MOVING_DEADBAND_MPS,
+    STALL_DWELL_S,
+    STALL_POSITION_ERROR_M,
+    WAIT_FOR_STOP_WINDOW_S,
     IsaacJointBus,
     IsaacServo,
     StallDetector,
@@ -198,9 +202,19 @@ def test_goal_position_becomes_a_metre_command(make_isaac_servo):
     assert gripper.servo.present_position == 2048
 
 
+def _detector():
+    """A ``StallDetector`` on the shipped thresholds."""
+    return StallDetector(
+        velocity_threshold_mps=MOVING_DEADBAND_MPS,
+        position_error_m=STALL_POSITION_ERROR_M,
+        dwell_s=STALL_DWELL_S,
+    )
+
+
 class _HardStopIsaacBus:
-    """Chases the last commanded goal at a fixed rate and clamps at a hard stop,
-    reporting **no force at all** while pinned against it.
+    """Ramps a target toward the last commanded goal, chases it with a
+    first-order-ish finger, clamps at a hard stop and reports **no force at
+    all** while pinned against it.
 
     The metres-and-Isaac-samples analogue of ``FakeServo``'s own
     ``obstruction_ticks`` model (see ``test_mock_motor_current.py``), used
@@ -226,36 +240,40 @@ class _HardStopIsaacBus:
     run would ever satisfy.
     """
 
-    STEP_M = 0.001  # metres advanced per wait_for_sample() call
+    STEP_M = 0.001  # metres the finger advances per wait_for_sample() call
+    # The target is paid out faster than the finger travels, so the finger
+    # runs a lag behind it exactly as the real one does -- which is what puts
+    # a standing error on the far side of a hard stop for the detector to see.
+    RAMP_STEP_M = 0.0016
 
-    def __init__(self, closed_stop_m):
+    def __init__(self, closed_stop_m, start_offset_m=0.03):
         self._closed_stop_m = closed_stop_m
-        # Start well clear of the stop, same as FakeServo's own default
-        # present_position_value not already being at its obstruction.
-        self._position_m = closed_stop_m + 0.03
+        self._position_m = closed_stop_m + start_offset_m
+        self._target_m = self._position_m
         self._goal_m = self._position_m
         self.wait_for_sample_calls = 0
-        self._stall = StallDetector(
-            velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
-            position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
-            dwell_s=IsaacJointBus.STALL_DWELL_S,
-        )
+        self._stall = _detector()
 
     def wait_for_sample(self, timeout_s=None):
         from ar_gripper import gripper as gripper_module
 
         self.wait_for_sample_calls += 1
-        target = max(self._goal_m, self._closed_stop_m)
-        delta = target - self._position_m
+        delta = self._goal_m - self._target_m
+        if abs(delta) <= self.RAMP_STEP_M:
+            self._target_m = self._goal_m  # snap exactly, not via += (float noise)
+        else:
+            self._target_m += self.RAMP_STEP_M if delta > 0 else -self.RAMP_STEP_M
+        reachable = max(self._target_m, self._closed_stop_m)
+        delta = reachable - self._position_m
         if abs(delta) <= self.STEP_M:
             moved = delta
-            self._position_m = target  # snap exactly, not via += (float noise)
+            self._position_m = reachable
         else:
             moved = self.STEP_M if delta > 0 else -self.STEP_M
             self._position_m += moved
         velocity = moved * 100.0  # nonzero while stepping, exactly 0.0 when settled
         self._stall.update(
-            self._goal_m - self._position_m, velocity, gripper_module.time.time()
+            self._target_m, self._position_m, velocity, gripper_module.time.time()
         )
         return self._position_m, velocity, 0.0
 
@@ -270,8 +288,24 @@ class _HardStopIsaacBus:
         pass
 
 
-def test_isaac_backed_calibration_converges(fake_serials, fast_clock):
-    """Homing runs to completion against a stop that reports no force.
+# Where the finger is when homing starts, as an offset from the closed stop.
+# Homing has to converge from all of them, and used not to: each attempt
+# commands exactly 2047 ticks (25.9 mm) of closing from wherever the finger
+# already is, so the overshoot past the stop -- the only thing an
+# error-threshold rule can see -- is a function of the starting position, and
+# there are starting positions that leave it arbitrarily small.
+#
+# 0.0 is where homing itself leaves the finger on the *previous* run (at the
+# open end, which is this offset from the stop) once the stroke is homed, so a
+# driver restart is exactly this case; 0.0259 is where the first attempt lands
+# on the stop with essentially no overshoot at all.
+_HOMING_START_OFFSETS_M = [0.0, 0.0018, 0.0259, 0.03, 0.05]
+
+
+@pytest.mark.parametrize("start_offset_m", _HOMING_START_OFFSETS_M)
+def test_isaac_backed_calibration_converges(fake_serials, fast_clock, start_offset_m):
+    """Homing runs to completion against a stop that reports no force, from
+    anywhere in the stroke.
 
     Same shape as test_mock_motor_current.py's
     test_calibrate_homes_against_an_obstruction, driven from Isaac-shaped
@@ -288,7 +322,9 @@ def test_isaac_backed_calibration_converges(fake_serials, fast_clock):
 
     device = USB2FeetechDevice("/dev/fake")
     fake = fake_serials[-1]
-    fake.servos[SID] = IsaacServo(_HardStopIsaacBus(closed_stop_m=0.02))
+    fake.servos[SID] = IsaacServo(
+        _HardStopIsaacBus(closed_stop_m=0.02, start_offset_m=start_offset_m)
+    )
     gripper = Gripper(device, "primary", SID)
 
     assert gripper.calibrate() is True
@@ -296,28 +332,24 @@ def test_isaac_backed_calibration_converges(fake_serials, fast_clock):
 
 
 def test_a_finger_that_reaches_its_target_is_never_called_stalled():
-    """The failure mode the two thresholds are jointly sized against.
+    """The failure mode the thresholds are jointly sized against.
 
     A finger settling into a reachable target spends most of its travel time
     creeping the last little way in -- the settle tail is around 70% of a
     stroke -- so "slow" alone is not evidence of anything, and a rule that
     treated it as evidence would report contact on every ordinary move. This
-    walks the drive's own first-order response all the way to rest, sampling
-    it at the publish rate, and asserts the detector stays quiet through every
-    one of those samples.
+    walks the drive's own first-order response all the way to rest against a
+    stationary target, sampling it at the publish rate, and asserts the
+    detector stays quiet through every one of those samples.
     """
-    detector = StallDetector(
-        velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
-        position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
-        dwell_s=IsaacJointBus.STALL_DWELL_S,
-    )
+    detector = _detector()
     dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
-    tau = 0.62  # the drive's real time constant, not the conservative one
+    tau = 0.62  # the drive's own time constant, as the stage reports it
     error = 0.019  # the lag a full-speed ramp leaves behind it
 
     for step in range(int(30.0 / dt)):
         velocity = error / tau
-        assert not detector.update(error, velocity, step * dt), (
+        assert not detector.update(0.0, -error, velocity, step * dt), (
             f"a freely settling finger was called stalled at t={step * dt:.2f} s, "
             f"error {error * 1e3:.3f} mm, velocity {velocity * 1e3:.3f} mm/s"
         )
@@ -326,20 +358,68 @@ def test_a_finger_that_reaches_its_target_is_never_called_stalled():
 
 
 def test_a_finger_held_off_its_target_is_called_stalled_after_the_dwell():
-    detector = StallDetector(
-        velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
-        position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
-        dwell_s=IsaacJointBus.STALL_DWELL_S,
-    )
-    error = 2 * IsaacJointBus.STALL_POSITION_ERROR_M
-    dwell = IsaacJointBus.STALL_DWELL_S
+    """The pressing arm: a target that has finished being paid out, sitting
+    beyond a joint that is not moving.
+    """
+    detector = _detector()
+    error = 2 * STALL_POSITION_ERROR_M
 
-    assert not detector.update(error, 0.0, 0.0)
-    assert not detector.update(error, 0.0, dwell / 2)
-    assert detector.update(error, 0.0, dwell)
+    assert not detector.update(error, 0.0, 0.0, 0.0)
+    assert not detector.update(error, 0.0, 0.0, STALL_DWELL_S / 2)
+    assert detector.update(error, 0.0, 0.0, STALL_DWELL_S)
     # And releases the moment the joint gets going again, so a move that was
     # blocked and then freed does not keep reporting contact.
-    assert not detector.update(error, IsaacJointBus.STALL_VELOCITY_MPS, dwell + 0.01)
+    assert not detector.update(error, 0.0, MOVING_DEADBAND_MPS, STALL_DWELL_S + 0.01)
+
+
+def test_a_joint_already_stopped_when_the_move_starts_needs_no_run_up():
+    """The outrun arm, and the reason it exists.
+
+    Every homing attempt after the first begins with the finger already
+    against the stop and no error accumulated yet, and the driver only leaves
+    WAIT_FOR_STOP_WINDOW_S between the move starting and reading the load. A
+    rule that waited for the target to be paid out past an error threshold
+    would spend a slice of that window that varies with how far the *previous*
+    attempt happened to overshoot -- which is how homing came to work from some
+    starting positions and fail from others.
+
+    The ramp here is deliberately slow (2 mm/s), because that is what makes the
+    difference visible: waiting for the error would take half a second before
+    the dwell even started.
+    """
+    detector = _detector()
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+    rate = 0.002
+    target = 0.0
+    latched_at = None
+
+    for step in range(int(2.0 / dt)):
+        now = step * dt
+        if detector.update(target, 0.0, 0.0, now):
+            latched_at = now
+            break
+        target -= rate * dt  # paid out away from a joint that never moves
+
+    assert latched_at is not None, "a joint held off a moving target never stalled"
+    assert latched_at <= STALL_DWELL_S + 2 * dt, (
+        f"stalled only after {latched_at:.3f} s, which is the dwell plus a run-up; "
+        f"the dwell alone is {STALL_DWELL_S:.3f} s and the window the driver "
+        f"leaves is {WAIT_FOR_STOP_WINDOW_S:.3f} s"
+    )
+
+
+def test_the_dwell_fits_the_window_the_driver_leaves_for_it():
+    """The budget, asserted rather than reasoned about in a comment.
+
+    Gripper._wait_for_stop returns this long after the finger stops and homing
+    reads the load immediately; a dwell that does not fit inside it is a stall
+    homing never sees. Both sides are read off the driver, so this also fails
+    if _wait_for_stop's own pacing changes underneath.
+    """
+    from ar_gripper.gripper import Gripper
+
+    assert WAIT_FOR_STOP_WINDOW_S == pytest.approx(3 * Gripper._WAIT_CHECK_TIME_S)
+    assert STALL_DWELL_S < WAIT_FOR_STOP_WINDOW_S
 
 
 def test_the_stall_reaches_the_driver_as_load_and_as_current(make_isaac_servo):
@@ -562,33 +642,34 @@ def test_the_first_sample_seeds_the_goal_instead_of_commanding_a_full_close():
 
 
 def test_the_bus_reports_a_stall_against_the_target_it_publishes():
-    """Not just that the rule works -- that the bus feeds it the right two
-    numbers. The error has to be measured against the target the ramp has
-    actually published, because the goal can be a whole stroke ahead of it
-    while the ramp is still paying it out, and measuring against that would
-    report a stall on every long move.
+    """Not just that the rule works -- that the bus feeds it the right target.
 
-    The stub node's clock advances one publish period per call, so a sample
-    costs the dwell exactly one tick's worth of time.
+    The error has to be measured against the target the ramp has actually
+    published, because the goal can be a whole stroke ahead of it while the
+    ramp is still paying it out, and measuring against the goal would report a
+    stall on every long move before the finger had been asked to go anywhere.
+
+    Which is why the ramp is deliberately left un-ticked here for longer than
+    the dwell, with the goal a whole stroke away: against the published target
+    there is nothing to see (a quarter of a millimetre from the joint, and not
+    moving), while against the goal this is 50 mm of error on a joint that is
+    not moving. The stub node's clock advances one publish period per call.
     """
     bus, node = make_bus()
     node.subscription_callback(sample(0.0))
     bus.set_drive_parameter(_DRIVE_SPEED_ADDR, 2450)
-    # A goal a whole stroke away, with the ramp only one tick into paying it
-    # out: the joint is stationary and nowhere near its goal, and this is
-    # exactly the moment a naive rule reports contact.
     bus.command(-0.05)
-    node.timer_callback()
-    node.timer_callback()
-    node.subscription_callback(sample(0.0))
+    node.timer_callback()  # the first tick has no interval to integrate
+    node.timer_callback()  # one publish period of ramp: ~0.26 mm
+
+    samples = int(3 * STALL_DWELL_S * IsaacJointBus.COMMAND_RATE_HZ)
+    for _ in range(samples):
+        node.subscription_callback(sample(0.0))
     assert bus.stalled is False
 
     # Let the ramp run past the joint, holding the joint still, and the same
-    # samples become a stall once the published target is out of reach for
-    # longer than the dwell.
-    for _ in range(
-        int(2 * IsaacJointBus.STALL_DWELL_S * IsaacJointBus.COMMAND_RATE_HZ)
-    ):
+    # samples become a stall.
+    for _ in range(samples):
         node.timer_callback()
         node.subscription_callback(sample(0.0))
     assert bus.stalled is True

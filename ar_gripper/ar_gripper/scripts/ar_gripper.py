@@ -591,13 +591,18 @@ class ARGripperNode(Node):
         that is already some way into its run expires the instant the real time
         arrives, which surfaces as a 20 s homing move "timing out" three
         seconds after it started, blaming the move for the clock.
+
+        The two get a budget each rather than sharing one. Sharing it means a
+        slow first sample leaves nothing for the clock, so the clock wait
+        expires without ever having waited and reports a simulator "publishing
+        joint states but not /clock" that was in fact only late.
         """
-        deadline = monotonic() + self.SIMULATOR_WAIT_S
         if not joint_bus.wait_for_first_sample(self.SIMULATOR_WAIT_S):
             sys.exit(
                 "No /isaac/joint_states within "
                 f"{self.SIMULATOR_WAIT_S:g} s: no simulator to drive"
             )
+        deadline = monotonic() + self.SIMULATOR_WAIT_S
         while self._isaac_node.get_clock().now().nanoseconds == 0:
             if monotonic() >= deadline:
                 sys.exit(

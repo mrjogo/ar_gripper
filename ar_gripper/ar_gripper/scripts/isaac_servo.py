@@ -16,6 +16,7 @@ wheel (see ``pyproject.toml``'s ``only-include``); it lives in ``scripts/``,
 which is excluded from it, alongside ``ar_gripper.py``.
 """
 
+import inspect
 import threading
 from time import monotonic as _real_monotonic
 from time import sleep as _real_sleep
@@ -25,7 +26,7 @@ from rclpy.duration import Duration
 from sensor_msgs.msg import JointState
 
 from ar_gripper.description import finger_velocity_limit_mps
-from ar_gripper.gripper import Deadline
+from ar_gripper.gripper import Deadline, Gripper
 from ar_gripper.mock import FakeServo
 
 # Feetech register addresses for the two writes this backend needs to see but
@@ -42,6 +43,68 @@ _TORQUE_LIMIT_ADDR = 0x30
 # IsaacServo.TICKS_PER_METRE for that would recreate exactly the coupling
 # those two addresses were pulled out here to avoid.
 _TICKS_PER_METRE = 78_900.0
+
+# -- contact detection: the three numbers, and the budget they have to fit -------
+#
+# The speed below which the servo's moving_sign register reads 0 -- the
+# driver's own definition of "stopped". The stall detector below asks the same
+# question with the same number, deliberately: Gripper._wait_for_stop will not
+# return until the joint is under this, so a stall can only ever be reported
+# about a joint the driver already agrees has stopped, and the two cannot
+# disagree about what stopped means. (Also why no separate, larger stall
+# velocity is defined: one at, say, a tick per sample would sit only twice
+# under the finger's whole velocity limit, so a regenerated asset carrying a
+# stale limit could put a finger at full speed two ticks from "not moving".)
+MOVING_DEADBAND_MPS = 1.0e-4
+
+# How far from its target a *stopped* joint has to be before that gap counts as
+# something holding it back. Bounded from both sides, and neither bound needs
+# the simulated drive's gains restated here:
+#
+#   Below: a joint that is still settling toward a reachable target carries a
+#   lag of velocity x the drive's time constant, so at MOVING_DEADBAND_MPS it
+#   is tens of microns from its target -- 62 um at the 0.62 s the stage reports
+#   for the finger drive, and still only 125 um if that doubled. This sits 8x
+#   above the pessimistic figure, so no particular time constant is load
+#   bearing.
+#
+#   Above: Gripper._calibrate commands exactly 2047 ticks (25.9 mm) of closing
+#   per homing attempt, measured from wherever the finger already is, so that
+#   is the smallest overshoot past a hard stop that homing is *guaranteed* to
+#   produce. This sits 26x below it.
+STALL_POSITION_ERROR_M = 1.0e-3
+
+
+def _wait_for_stop_reads():
+    """How many settled reads ``Gripper._wait_for_stop`` wants before returning.
+
+    Read off the driver rather than restated, because it sets the deadline the
+    detector below has to meet and a silent disagreement would show up only as
+    homing failing against a simulator.
+    """
+    parameter = inspect.signature(Gripper._wait_for_stop).parameters.get("stop_delay")
+    if parameter is None or parameter.default is inspect.Parameter.empty:
+        raise RuntimeError(
+            "Gripper._wait_for_stop no longer takes a stop_delay default; the "
+            "simulated servo's stall dwell is derived from it (it must fit "
+            "inside the window that many settled reads leave) and now has "
+            "nothing to derive from"
+        )
+    return parameter.default
+
+
+# The window this has to fit inside. Once the finger stops moving,
+# Gripper._wait_for_stop returns after this long, and the homing loop reads
+# present_load the moment it does -- so a stall that takes longer than this to
+# report is a stall homing never sees, and it burns one of its three attempts.
+# It is the binding resource in the whole design, which is why the detector
+# arms on the target being paid out rather than on the error that paying it out
+# eventually produces: waiting for the error would spend a slice of this window
+# that varies with wherever the previous attempt happened to stop.
+WAIT_FOR_STOP_WINDOW_S = Gripper._WAIT_CHECK_TIME_S * _wait_for_stop_reads()
+# Two thirds of it spent, a third held back for the reads themselves and for
+# the sample that starts the dwell arriving up to one publish period late.
+STALL_DWELL_S = 0.6 * WAIT_FOR_STOP_WINDOW_S
 
 
 class RosClock:
@@ -109,28 +172,41 @@ class StallDetector:
     a constraint rather than a collision.
 
     So contact is detected the way NVIDIA's own ``snap_to_limits`` sample
-    detects a joint that has run into something: a velocity threshold plus a
-    persistent position error, both of which already ride in the joint state
-    that is published anyway. The joint is stalled when it is commanded
-    somewhere it is not going -- the target is further than
-    ``position_error_m`` away while the joint moves slower than
-    ``velocity_threshold_mps`` -- and stays that way for ``dwell_s``.
+    detects a joint that has run into something -- from motion rather than
+    force, out of the joint state that is published anyway. The joint is
+    stalled when it has stopped (by the driver's own ``moving_sign``
+    definition of stopped, ``velocity_threshold_mps``) while it is *still being
+    commanded somewhere else*, and stays that way for ``dwell_s``.
 
-    The two thresholds are deliberately not independent, and that coupling is
-    what makes the rule safe against the case it would otherwise get wrong: a
-    finger that is merely *slow* because it is still settling. The drive is
-    heavily overdamped (mass 0.04 kg against 52 N/m and 32 N*s/m), so its
-    approach to a reachable target is first order, and first-order lag ties the
-    two signals together exactly -- error = velocity * tau. A finger that is
-    only settling and is slower than the velocity threshold is therefore within
-    ``velocity_threshold_mps * tau`` of its target *by construction* and cannot
-    be further away, at any point of the settle tail. Setting the error
-    threshold to a multiple of that lag makes the two halves jointly
-    unsatisfiable for free settling, which is the guarantee the dwell would
-    otherwise have to provide by being longer than the tail itself.
+    "Still being commanded somewhere else" has two shapes, and the detector has
+    to arm on either, because they are what the same contact looks like at
+    different moments:
 
-    What the dwell is left doing is rejecting noise: a single sample pair that
-    lands under one threshold and over the other must not latch a stall.
+    * **Outrun.** The target is being paid out away from the joint faster than
+      the joint counts as moving, and the joint is not following. This is a
+      finger that was *already* against something when the move began, and it
+      arms on the first sample of the move -- it needs no error to have
+      accumulated yet, which is the point. Waiting for accumulated error here
+      is what makes homing's budget depend on where the previous attempt
+      happened to stop (see ``WAIT_FOR_STOP_WINDOW_S``).
+    * **Pressing.** The target has finished being paid out and sits more than
+      ``position_error_m`` beyond the joint, which is a finger that arrived at
+      the stop after the ramp had already reached its goal.
+
+    The failure mode both are sized against is a finger that is merely *slow*
+    because it is still settling into a reachable target -- the settle tail is
+    around 70% of a stroke, so slow is the normal case and not evidence of
+    anything. Neither shape can be produced by one. The drive is heavily
+    overdamped, so its approach to a reachable target is first order and its
+    lag is exactly velocity x the drive's time constant: at
+    ``velocity_threshold_mps`` that is tens of microns, far inside
+    ``position_error_m`` (pressing cannot arm), and its target is by definition
+    stationary (outrun cannot arm).
+
+    What the dwell is left doing is rejecting transients: a single sample that
+    lands under one threshold and over the other, or the moment at the start of
+    a move where the target is already moving and the joint has not yet picked
+    up, must not latch a stall.
 
     Honest about what this is: emulation, not physics. Homing against a
     simulator exercises the driver's *sequencing*, not its stall detection, so
@@ -146,16 +222,32 @@ class StallDetector:
         self.velocity_threshold_mps = velocity_threshold_mps
         self.position_error_m = position_error_m
         self.dwell_s = dwell_s
+        self._previous_target_m = None
+        self._previous_time_s = None
         self._since_s = None
         self.stalled = False
 
-    def update(self, position_error_m, velocity_mps, now_s):
+    def update(self, target_m, position_m, velocity_mps, now_s):
         """Fold one sample in and return whether the joint is stalled."""
-        holding = (
-            abs(velocity_mps) < self.velocity_threshold_mps
-            and abs(position_error_m) > self.position_error_m
+        error_m = target_m - position_m
+        target_velocity_mps = 0.0
+        if self._previous_target_m is not None and now_s > self._previous_time_s:
+            target_velocity_mps = (target_m - self._previous_target_m) / (
+                now_s - self._previous_time_s
+            )
+        self._previous_target_m = target_m
+        self._previous_time_s = now_s
+
+        stopped = abs(velocity_mps) < self.velocity_threshold_mps
+        pressing = abs(error_m) > self.position_error_m
+        # Signs, not magnitudes: a target moving *toward* the joint is a move
+        # arriving, not a joint being left behind, and only the away direction
+        # says anything about contact.
+        outrun = (
+            abs(target_velocity_mps) > self.velocity_threshold_mps
+            and target_velocity_mps * error_m > 0.0
         )
-        if not holding:
+        if not (stopped and (pressing or outrun)):
             self._since_s = None
             self.stalled = False
             return self.stalled
@@ -210,40 +302,6 @@ class IsaacJointBus:
     # stall behind a slow grasp).
     _RTF_FLOOR = 0.68
     DEFAULT_TIMEOUT_S = 5.0 / (COMMAND_RATE_HZ * _RTF_FLOOR)
-
-    # -- stall thresholds (see StallDetector for why motion, not force) --------------
-    #
-    # Settling time constant of the simulated finger drive, damping/stiffness,
-    # which the stage that authors those gains reports at startup. 0.62 s at
-    # the gains the asset carries; the stage lowers the drive when a run asks
-    # for a physics rate below the one it was authored for, which *raises* the
-    # time constant, to ~1.25 s at the lowest supported rate. The higher figure
-    # is used because over-estimating is the safe direction here: it widens the
-    # error threshold below, and a wider threshold can only ever be slower to
-    # call a stall, never quicker to call one falsely.
-    FINGER_DRIVE_TAU_S = 1.25
-    # "Not moving": one encoder tick per published sample. Below this the
-    # finger cannot move a single count of the position register between two
-    # consecutive joint states, i.e. it is motion the driver's own resolution
-    # cannot see. (IsaacServo.MOVING_DEADBAND_MPS is a different and much
-    # smaller number, for a different question -- what the servo's moving_sign
-    # register reports, which the driver uses to decide a move has ended.)
-    STALL_VELOCITY_MPS = COMMAND_RATE_HZ / _TICKS_PER_METRE
-    # How much further than a settling finger's own lag the target has to be
-    # before that gap counts as something holding the finger back. At the
-    # velocity threshold a freely settling finger is exactly
-    # STALL_VELOCITY_MPS * FINGER_DRIVE_TAU_S from its target, so this margin
-    # is the whole distance between "still arriving" and "stopped short", and
-    # it is spent on the second-order transient the first-order model leaves
-    # out, on the mimic constraint's own compliance, and on velocity noise.
-    STALL_LAG_MARGIN = 4.0
-    STALL_POSITION_ERROR_M = STALL_LAG_MARGIN * STALL_VELOCITY_MPS * FINGER_DRIVE_TAU_S
-    # Long enough that no single sample can latch a stall (~24 samples at the
-    # publish rate), and bounded above by the driver: Gripper._wait_for_stop
-    # returns three _WAIT_CHECK_TIME_S apart once the finger stops, and the
-    # homing loop reads the load immediately after it does, so a dwell longer
-    # than 0.3 s spends one of homing's three attempts every time.
-    STALL_DWELL_S = 0.2
 
     def __init__(
         self,
@@ -301,9 +359,9 @@ class IsaacJointBus:
         # reads, so the dwell is measured over the rate Isaac actually
         # publishes at instead of over however often the driver happens to look.
         self._stall = StallDetector(
-            velocity_threshold_mps=self.STALL_VELOCITY_MPS,
-            position_error_m=self.STALL_POSITION_ERROR_M,
-            dwell_s=self.STALL_DWELL_S,
+            velocity_threshold_mps=MOVING_DEADBAND_MPS,
+            position_error_m=STALL_POSITION_ERROR_M,
+            dwell_s=STALL_DWELL_S,
         )
 
         # Raw 0.1%/LSB register word from the last TORQUE_LIMIT (0x30) write.
@@ -361,7 +419,8 @@ class IsaacJointBus:
             # stroke ahead of it while the ramp is still paying it out, which
             # would read as a stall on every long move.
             self._stall.update(
-                self._published_m - position,
+                self._published_m,
+                position,
                 velocity,
                 self._node.get_clock().now().nanoseconds / 1e9,
             )
@@ -535,21 +594,34 @@ class IsaacServo(FakeServo):
     # the finger toward 0.0 m instead of toward the open stop.
     CLOSED_POSITION_TICKS = 4095  # == Gripper._POSITION_MAX
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
-    # Below this the joint counts as unloaded. Measured against a real grasp,
-    # this is currently above every force the simulated gripper can produce:
-    # closing on a 40 mm rigid box reads -0.835 N on this joint and -0.790 N on
-    # the mimic finger (they sum to the 1.63 N the drive develops at 31 mm of
-    # position error), against +0.0003 N free-running -- a clean signal 2700x
-    # the noise floor, and still under half of this threshold. The simulated
-    # drive's ceiling is the reason: 52 N/m over a 50 mm stroke cannot exceed
-    # 2.6 N, where a 400 g glass on a condensation-wet counterface needs ~4.4 N.
-    # Raising that ceiling (the drive's stable stiffness scales with 1/dt^2, so
-    # it follows the physics rate) is what makes this threshold worth
-    # re-deriving; lowering it before then would only report a load nothing
-    # acts on, since 0.835 N is 0.08% of stall torque against a homing test at
-    # 10%.
+    # Below this the joint counts as unloaded -- and on this stage that is
+    # every load it can have, so THE FORCE LIMB OF _contact_load IS CURRENTLY
+    # UNREACHABLE. Measured: closing on a 40 mm rigid box reads -0.835 N on
+    # this joint (and -0.790 N on the mimic finger; the two contacts are
+    # separate external loads and sum to the 1.63 N the drive develops at
+    # 31 mm of position error), against +0.0003 N free-running. The driver
+    # reads this joint alone, so it sees 0.835 N -- and the drive cannot beat
+    # 51.84 N/m x the 0.05 m stroke = 2.59 N in total, i.e. 1.30 N on this
+    # joint, still under this threshold. So grasp force does not reach the
+    # driver at all: every grasp falls through to the stall limb below and
+    # reports FakeServo.stall_load, which a GripperCommand result turns into a
+    # constant 312 N whatever is being held.
+    #
+    # Not a noise-rejection threshold: the measured noise floor is 3.3e-4 N, so
+    # this is 6000x above it, a number inherited from a servo whose stall
+    # torque really is on this scale. It is left alone rather than re-derived
+    # because re-deriving it now would only expose a reading nothing acts on
+    # (0.835 N is 0.08% of stall torque, against homing's contact test at 10%)
+    # and would still be masked by the stall limb, which reports 30%. What
+    # makes it worth re-deriving is the drive's stiffness ceiling going up --
+    # it scales with 1/dt^2, so it follows the physics rate -- at which point
+    # this should come from the noise floor and the grip forces then reachable,
+    # not from the servo's datasheet.
     LOAD_DEADBAND_N = 2.0
-    MOVING_DEADBAND_MPS = 1.0e-4  # below this, moving_sign reads 0 (stopped)
+    # Below this, moving_sign reads 0 (stopped) -- the module-scope constant,
+    # which the stall detector is built on too, so nothing here and nothing
+    # there can drift apart about what stopped means.
+    MOVING_DEADBAND_MPS = MOVING_DEADBAND_MPS
 
     def __init__(self, bus):
         # mock.FakeServo's internal travel/obstruction model stays off: Isaac
