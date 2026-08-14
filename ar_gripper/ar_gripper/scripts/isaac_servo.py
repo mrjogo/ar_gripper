@@ -594,29 +594,31 @@ class IsaacServo(FakeServo):
     # the finger toward 0.0 m instead of toward the open stop.
     CLOSED_POSITION_TICKS = 4095  # == Gripper._POSITION_MAX
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
-    # Below this the joint counts as unloaded -- and on this stage that is
-    # every load it can have, so THE FORCE LIMB OF _contact_load IS CURRENTLY
-    # UNREACHABLE. Measured: closing on a 40 mm rigid box reads -0.835 N on
-    # this joint (and -0.790 N on the mimic finger; the two contacts are
-    # separate external loads and sum to the 1.63 N the drive develops at
-    # 31 mm of position error), against +0.0003 N free-running. The driver
-    # reads this joint alone, so it sees 0.835 N -- and the drive cannot beat
-    # 51.84 N/m x the 0.05 m stroke = 2.59 N in total, i.e. 1.30 N on this
-    # joint, still under this threshold. So grasp force does not reach the
-    # driver at all: every grasp falls through to the stall limb below and
-    # reports FakeServo.stall_load, which a GripperCommand result turns into a
-    # constant 312 N whatever is being held.
+    # Below this the joint counts as unloaded. An earlier version of this
+    # comment recorded the force limb of _contact_load as UNREACHABLE, because
+    # the finger drive was 51.84 N/m and could not beat 1.30 N on this joint
+    # against the 2.0 N threshold; a grasp then read -0.835 N and fell through
+    # to the stall limb every time. That is no longer true. The drive's
+    # stability ceiling was re-measured and the stiffness went up 9x to
+    # 466.56 N/m, which is exactly the condition this comment said to re-derive
+    # on, so: a grasp on the same 40 mm rigid box now reads 7.32 N on this joint
+    # (14.63 N summed across the two contacts), and the force limb is reachable
+    # for the first time.
     #
-    # Not a noise-rejection threshold: the measured noise floor is 3.3e-4 N, so
-    # this is 6000x above it, a number inherited from a servo whose stall
-    # torque really is on this scale. It is left alone rather than re-derived
-    # because re-deriving it now would only expose a reading nothing acts on
-    # (0.835 N is 0.08% of stall torque, against homing's contact test at 10%)
-    # and would still be masked by the stall limb, which reports 30%. What
-    # makes it worth re-deriving is the drive's stiffness ceiling going up --
-    # it scales with 1/dt^2, so it follows the physics rate -- at which point
-    # this should come from the noise floor and the grip forces then reachable,
-    # not from the servo's datasheet.
+    # Left at 2.0 N anyway, for now, because what it changes is still small: the
+    # limbs are combined with max(), so a genuine stall still reports the larger
+    # stall_load, and 7.32 N is 0.70% of stall torque against homing's contact
+    # test at 10% and the overload test at 30%. Nothing acts differently at
+    # 0.70% than it did at 0.08%.
+    #
+    # It is not a noise-rejection threshold -- the measured noise floor is
+    # 3.3e-4 N, so this sits 6000x above it, a number inherited from a servo
+    # whose stall torque really is on this scale. Now that grasp force reaches
+    # the driver, the honest derivation is from that noise floor and the grip
+    # forces actually reachable, not from the servo's datasheet; that is
+    # recorded in barbot_isaac/FUTURE_WORK.md rather than done here, because
+    # changing it changes what every grasp reports and wants its own
+    # measurement of what the consumers should see.
     LOAD_DEADBAND_N = 2.0
     # Below this, moving_sign reads 0 (stopped) -- the module-scope constant,
     # which the stall detector is built on too, so nothing here and nothing
