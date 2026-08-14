@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from math import isclose
-from threading import Lock
+from threading import Lock, Thread
 
 import rclpy
 from ar_gripper_interfaces.srv import SetHoldingTorque
@@ -371,52 +371,82 @@ class ARGripperNode(Node):
             # (USB2FeetechDevice opens serial in __init__).
             self._isaac_bus, _ = install_fake_serial(None)
 
-        device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
-        for gripper_name, servo_ids in gripper_params.items():
-            if len(servo_ids) != 1:
-                raise ValueError(
-                    "Only one servo ID per gripper is supported, but gripper "
-                    f"'{gripper_name}' has {len(servo_ids)}"
-                )
-            if mock:
-                # Seed the fake servo so the real startup homing (Gripper.calibrate)
-                # finds contact then retreats, and skip position persistence (path
-                # None) so every mock run rehomes deterministically instead of
-                # trusting a saved real position.
-                from ar_gripper.mock import HOMING_LOAD_SEQUENCE
-
-                self._mock_bus[-1].servo(servo_ids[0]).load_sequence = list(
-                    HOMING_LOAD_SEQUENCE
-                )
-            if isaac:
-                # Replace the default in-memory register file with one backed
-                # by Isaac before the Gripper constructor probes the bus.
-                # FakeSerial.servo() uses setdefault, so pre-seeding here is
-                # enough -- no change to mock.py is required. The joint name
-                # is spelled out because tf_prefix is empty in this
-                # deployment; if that ever changes, this is one of three
-                # places (with TurntableNode.JOINT_NAME and the xacro) that
-                # must change together.
-                joint_bus = IsaacJointBus(
-                    self,
-                    joint_states_topic=isaac_joint_states_topic,
-                    command_topic=isaac_command_topic,
-                    joint_name="primary_ar_gripper_body_finger1",
-                )
-                self._isaac_bus[-1].servos[servo_ids[0]] = IsaacServo(joint_bus)
-            gripper = ARGripper(
-                device,
-                gripper_name,
-                servo_ids[0],
-                (
-                    None
-                    if (mock or isaac)
-                    else os.path.expanduser(servo_position_path.value)
-                ),
-                self,
+            # Startup calibration below (inside the ARGripper() constructor)
+            # runs synchronously, still inside this Node's own __init__ --
+            # which returns to main() *before* its executor ever spins this
+            # node. Without help, IsaacJointBus's joint_states subscription
+            # and its command ramp timer would never run, and homing would
+            # starve waiting for a sample that never arrives (every read
+            # would silently time out and see the same frozen (0, 0, 0)
+            # sample forever). Spin this node on a private, temporary
+            # executor for the rest of construction; torn down again below
+            # before __init__ returns, so main()'s own executor is the only
+            # one ever spinning it once construction is done.
+            self._isaac_bootstrap_executor = rclpy.executors.SingleThreadedExecutor()
+            self._isaac_bootstrap_executor.add_node(self)
+            self._isaac_bootstrap_thread = Thread(
+                target=self._isaac_bootstrap_executor.spin, daemon=True
             )
-            self.all_servos.append(gripper.gripper.servo)
-            self._grippers.append(gripper)
+            self._isaac_bootstrap_thread.start()
+
+        device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
+        try:
+            for gripper_name, servo_ids in gripper_params.items():
+                if len(servo_ids) != 1:
+                    raise ValueError(
+                        "Only one servo ID per gripper is supported, but gripper "
+                        f"'{gripper_name}' has {len(servo_ids)}"
+                    )
+                if mock:
+                    # Seed the fake servo so the real startup homing
+                    # (Gripper.calibrate) finds contact then retreats, and skip
+                    # position persistence (path None) so every mock run rehomes
+                    # deterministically instead of trusting a saved real position.
+                    from ar_gripper.mock import HOMING_LOAD_SEQUENCE
+
+                    self._mock_bus[-1].servo(servo_ids[0]).load_sequence = list(
+                        HOMING_LOAD_SEQUENCE
+                    )
+                if isaac:
+                    # Replace the default in-memory register file with one backed
+                    # by Isaac before the Gripper constructor probes the bus.
+                    # FakeSerial.servo() uses setdefault, so pre-seeding here is
+                    # enough -- no change to mock.py is required. The joint name
+                    # is spelled out because tf_prefix is empty in this
+                    # deployment; if that ever changes, this is one of three
+                    # places (with TurntableNode.JOINT_NAME and the xacro) that
+                    # must change together.
+                    joint_bus = IsaacJointBus(
+                        self,
+                        joint_states_topic=isaac_joint_states_topic,
+                        command_topic=isaac_command_topic,
+                        joint_name="primary_ar_gripper_body_finger1",
+                    )
+                    self._isaac_bus[-1].servos[servo_ids[0]] = IsaacServo(joint_bus)
+                gripper = ARGripper(
+                    device,
+                    gripper_name,
+                    servo_ids[0],
+                    (
+                        None
+                        if (mock or isaac)
+                        else os.path.expanduser(servo_position_path.value)
+                    ),
+                    self,
+                )
+                self.all_servos.append(gripper.gripper.servo)
+                self._grippers.append(gripper)
+        finally:
+            # Runs on the success path below and also on a calibration
+            # failure, which sys.exit()s out of the loop above: either way
+            # the bootstrap executor must stop spinning this node in its own
+            # thread before __init__ unwinds, or the daemon thread is still
+            # running when the interpreter starts finalizing on the way out
+            # of sys.exit() and crashes on shutdown.
+            if isaac:
+                self._isaac_bootstrap_executor.remove_node(self)
+                self._isaac_bootstrap_executor.shutdown()
+                self._isaac_bootstrap_thread.join(timeout=2.0)
 
         self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1

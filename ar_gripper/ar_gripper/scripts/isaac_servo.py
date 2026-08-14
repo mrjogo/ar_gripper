@@ -148,8 +148,13 @@ class IsaacJointBus:
         acted on) -- see Task 11.
         """
         if addr == _DRIVE_SPEED_ADDR:
+            # The wire encodes steps/s // 50 (FeetechSMSServo.drive_speed's
+            # setter divides by 50 before writing, and its getter multiplies
+            # back -- see feetech.py); `value` here is that raw register
+            # word, not steps/s, so it must be scaled back up before it means
+            # anything in metres/s.
             with self._condition:
-                self._drive_speed_mps = value / IsaacServo.TICKS_PER_METRE
+                self._drive_speed_mps = (value * 50) / IsaacServo.TICKS_PER_METRE
         # TORQUE_LIMIT: nothing to record into yet.
 
     def _publish_ramped_target(self):
