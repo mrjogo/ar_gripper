@@ -3,9 +3,9 @@
 ``IsaacJointBus`` owns the rclpy subscription/publisher pair that talks to
 Isaac's ``/isaac/joint_states`` and ``/isaac/gripper/joint_commands`` topics.
 ``IsaacServo`` is a ``FakeServo`` whose position and load come from Isaac
-instead of the internal travel/current model Task 9 added: the real
-``FeetechSMSServo`` packet framing, checksums and retry logic all still run
-against it unmodified, only the bytes on the wire are sourced from the
+instead of the internal travel/current model the base class already has: the
+real ``FeetechSMSServo`` packet framing, checksums and retry logic all still
+run against it unmodified, only the bytes on the wire are sourced from the
 simulator. See ``mock.py`` for everything this class inherits (the six
 pre-seeded config registers, the sign-magnitude position encoder, the 6.5
 mA/LSB current quantisation, the exactly-zero unloaded load, and the rule
@@ -18,6 +18,7 @@ which is excluded from it, alongside ``ar_gripper.py``.
 
 import threading
 
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import JointState
 
 from ar_gripper.mock import FakeServo
@@ -29,6 +30,13 @@ from ar_gripper.mock import FakeServo
 # without one importing the other's class attributes.
 _DRIVE_SPEED_ADDR = 0x2E
 _TORQUE_LIMIT_ADDR = 0x30
+
+# 3945 ticks over the 0.05 m stroke = 12.67 um/tick. Module-level for the same
+# reason as the two addresses above: IsaacJointBus.set_drive_parameter needs
+# it to convert a drive_speed write into metres/s, and reaching into
+# IsaacServo.TICKS_PER_METRE for that would recreate exactly the coupling
+# those two addresses were pulled out here to avoid.
+_TICKS_PER_METRE = 78_900.0
 
 
 class IsaacJointBus:
@@ -42,7 +50,7 @@ class IsaacJointBus:
     dependent DOF held to it by a real solver constraint (a
     ``PxArticulationMimicJoint``, confirmed in ``barbot_isaac``'s
     ``import_robot_usd.py`` / ``barbot_stage.py`` to follow finger1 to within
-    2.6e-4 m with no drive of its own) -- giving it an independent target
+    1.0e-4 m with no drive of its own) -- giving it an independent target
     would put a second actuator on the far side of that constraint, which the
     Isaac-side wiring deliberately avoids (``GripperController`` only
     receives finger1's command). It still shows up as its own DOF in
@@ -55,6 +63,18 @@ class IsaacJointBus:
     # the ramp timer matches that so the commanded target advances on every
     # tick the simulator can actually observe.
     COMMAND_RATE_HZ = 120.0
+    # The finger joint's own <limit .../> velocity, m/s -- ar_gripper_macro.xacro's
+    # ar_gripper_body_finger1 prismatic joint (finger2's mimic copy carries the
+    # same number). This is the ramp's speed ceiling: drive_speed converts to an
+    # absurd ~1.55 m/s at the servo's real max (122500 steps/s), which would
+    # cross the whole 0.05 m stroke in 4 ticks (33 ms) -- inside
+    # Gripper._goto_position's 0.3 s INRUSH_TIME, so the baseline window and the
+    # stall window would collapse into the same window before ever publishing a
+    # single intermediate target. Isaac itself cannot track faster than this
+    # regardless of what gets published, so clamping here makes the published
+    # target follow what the joint can actually do instead of running ahead of
+    # it and sitting there while the joint catches up on its own schedule.
+    MAX_FINGER_VELOCITY_MPS = 0.0031
     # Measured floor of the sim's real-time factor (mean 0.79, worst 0.68 --
     # see barbot_isaac stage notes). The wall-clock joint_states period is
     # 1 / (publish_hz * RTF); at the RTF floor that is ~12.25 ms. The wait cap
@@ -86,13 +106,40 @@ class IsaacJointBus:
         # the driver writes one, the ramp jumps straight to the goal, same as
         # FakeServo's own default travel model.
         self._drive_speed_mps = 0.0
+        # Raw 0.1%/LSB register word from the last TORQUE_LIMIT (0x30) write.
+        # No Isaac analogue yet -- recorded for a future finger-drive
+        # maxForce scale, not acted on.
+        self.torque_limit_raw = None
 
+        # The node's other timers (status/diagnostics/overload-check in
+        # ar_gripper.py) sit in its default MutuallyExclusiveCallbackGroup,
+        # which admits one callback at a time even under a
+        # MultiThreadedExecutor. present_position/present_load reads block
+        # inside that group for up to DEFAULT_TIMEOUT_S waiting on a fresh
+        # sample -- and while blocked, nothing else in that SAME group can
+        # run, including the subscription callback that would deliver the
+        # sample being waited for, if it too were in that group. A private
+        # group for the subscription keeps it able to run while a
+        # status/diagnostics read elsewhere on the node blocks, instead of
+        # every such read being a guaranteed stall. The 120 Hz ramp timer
+        # gets its OWN separate group rather than sharing the subscription's:
+        # both fire at a comparable rate, and serialising them against each
+        # other would recreate a smaller version of the same contention this
+        # split exists to avoid.
+        self._subscription_group = MutuallyExclusiveCallbackGroup()
+        self._timer_group = MutuallyExclusiveCallbackGroup()
         self._command_pub = node.create_publisher(JointState, command_topic, 10)
         node.create_subscription(
-            JointState, joint_states_topic, self._on_joint_states, 10
+            JointState,
+            joint_states_topic,
+            self._on_joint_states,
+            10,
+            callback_group=self._subscription_group,
         )
         self._ramp_timer = node.create_timer(
-            1.0 / self.COMMAND_RATE_HZ, self._publish_ramped_target
+            1.0 / self.COMMAND_RATE_HZ,
+            self._publish_ramped_target,
+            callback_group=self._timer_group,
         )
 
     def _on_joint_states(self, msg):
@@ -144,8 +191,8 @@ class IsaacJointBus:
         """Record a drive_speed (0x2E) or torque_limit (0x30) write.
 
         drive_speed paces the position ramp below. torque_limit has no Isaac
-        analogue yet (recorded for a future finger-drive maxForce scale, not
-        acted on) -- see Task 11.
+        analogue yet -- recorded on ``torque_limit_raw`` for a future
+        finger-drive maxForce scale, not acted on.
         """
         if addr == _DRIVE_SPEED_ADDR:
             # The wire encodes steps/s // 50 (FeetechSMSServo.drive_speed's
@@ -154,8 +201,10 @@ class IsaacJointBus:
             # word, not steps/s, so it must be scaled back up before it means
             # anything in metres/s.
             with self._condition:
-                self._drive_speed_mps = (value * 50) / IsaacServo.TICKS_PER_METRE
-        # TORQUE_LIMIT: nothing to record into yet.
+                self._drive_speed_mps = (value * 50) / _TICKS_PER_METRE
+        elif addr == _TORQUE_LIMIT_ADDR:
+            with self._condition:
+                self.torque_limit_raw = value
 
     def _publish_ramped_target(self):
         # Ramp the published target toward the goal at drive_speed rather
@@ -163,10 +212,18 @@ class IsaacJointBus:
         # reaches the goal in a couple of physics steps, the finger is
         # already at contact before the current baseline window opens, and
         # stall detection reads a contact baseline -- the Isaac analogue of
-        # Task 9's travel_ticks_per_read, and it exists for the same reason.
+        # mock.FakeServo's travel_ticks_per_read, and it exists for the same
+        # reason.
+        #
+        # Clamped to MAX_FINGER_VELOCITY_MPS: drive_speed is the *driver's*
+        # request, and at the servo's real max it is far faster than the
+        # joint's own <limit .../> velocity Isaac will actually track (see
+        # that constant's docstring) -- publishing the unclamped rate just
+        # runs the target ahead of the joint and leaves it to catch up on
+        # its own schedule regardless.
         with self._condition:
             goal = self._goal_m
-            rate = self._drive_speed_mps
+            rate = min(self._drive_speed_mps, self.MAX_FINGER_VELOCITY_MPS)
         if rate <= 0.0:
             self._published_m = goal
         else:
@@ -199,15 +256,25 @@ class IsaacServo(FakeServo):
     DRIVE_SPEED = _DRIVE_SPEED_ADDR
     TORQUE_LIMIT = _TORQUE_LIMIT_ADDR
 
-    TICKS_PER_METRE = 78_900.0  # 3945 ticks over the 0.05 m stroke = 12.67 um/tick
+    TICKS_PER_METRE = _TICKS_PER_METRE  # mirrors the module constant above
+    # tick 4095 == 0.0 m == CLOSED; tick 150 == 0.05 m == OPEN. Ticks go DOWN
+    # as metres go UP -- a negative slope, agreed by three
+    # independent sources: Gripper._POSITION_MAX (4095, "gripper closed") /
+    # _POSITION_MIN (150, "gripper open") in gripper.py, FINGER_CLOSED_POS
+    # (0.0) / FINGER_OPEN_POS (0.05) in standalone.py, and the finger link's
+    # close/open groups in the description macro. A first draft of this file
+    # had the slope inverted; live-verified against a running simulator that
+    # commanding "closed" (goal_position = CLOSED_POSITION_TICKS) now drives
+    # the finger toward 0.0 m instead of toward the open stop.
+    CLOSED_POSITION_TICKS = 4095  # == Gripper._POSITION_MAX
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
     LOAD_DEADBAND_N = 2.0  # below this the joint counts as unloaded
     MOVING_DEADBAND_MPS = 1.0e-4  # below this, moving_sign reads 0 (stopped)
 
     def __init__(self, bus):
-        # Task 9's internal travel/obstruction model stays off: Isaac is the
-        # only source of motion here, and a second model competing with it
-        # would fight the real one.
+        # mock.FakeServo's internal travel/obstruction model stays off: Isaac
+        # is the only source of motion here, and a second model competing
+        # with it would fight the real one.
         super().__init__(travel_ticks_per_read=0, obstruction_ticks=None)
         self._bus = bus
         self._tick_offset = 0.0
@@ -218,7 +285,9 @@ class IsaacServo(FakeServo):
         self._sample = self._bus.wait_for_sample()
         position_m, _velocity, _effort = self._sample
         self.present_position_value = round(
-            position_m * self.TICKS_PER_METRE + self._tick_offset
+            self.CLOSED_POSITION_TICKS
+            - position_m * self.TICKS_PER_METRE
+            + self._tick_offset
         )
 
     def _contact_load(self):
@@ -248,7 +317,12 @@ class IsaacServo(FakeServo):
             ticks = data[0] | (data[1] & 0x7F) << 8
             if data[1] & 0x80:
                 ticks *= -1
-            self._bus.command((ticks - self._tick_offset) / self.TICKS_PER_METRE)
+            # Inverse of _advance()'s decode (negative slope: see
+            # CLOSED_POSITION_TICKS), solved for metres given a target tick.
+            self._bus.command(
+                (self.CLOSED_POSITION_TICKS + self._tick_offset - ticks)
+                / self.TICKS_PER_METRE
+            )
         elif (
             addr == self.TORQUE_SWITCH
             and len(data) == 1
@@ -258,9 +332,14 @@ class IsaacServo(FakeServo):
             # the measured position reads 2048 from here on, rather than
             # teleporting the joint. Without it the tick<->metre map drifts
             # and MoveIt reports the wrong finger position. _calibrate() does
-            # this three times.
+            # this three times. Solved from the same negative-slope decode as
+            # _advance(), set equal to 2048 at the current sample's position.
             if self._sample is not None:
-                self._tick_offset = 2048 - self._sample[0] * self.TICKS_PER_METRE
+                self._tick_offset = (
+                    2048
+                    - self.CLOSED_POSITION_TICKS
+                    + self._sample[0] * self.TICKS_PER_METRE
+                )
         elif addr in (self.DRIVE_SPEED, self.TORQUE_LIMIT):
             value = (data[0] | data[1] << 8) if len(data) >= 2 else data[0]
             self._bus.set_drive_parameter(addr, value)

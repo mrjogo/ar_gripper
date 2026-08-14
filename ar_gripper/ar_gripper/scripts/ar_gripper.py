@@ -39,7 +39,15 @@ class ARGripper:
     duplicated.
     """
 
-    def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
+    def __init__(
+        self,
+        device,
+        gripper_name,
+        servo_id,
+        servo_position_path,
+        node,
+        skip_calibration=False,
+    ):
         self._node = node
         # Build the standalone WITHOUT calibrating yet, so the action/service
         # endpoints are advertised before the (potentially blocking) startup
@@ -77,10 +85,29 @@ class ARGripper:
             cancel_callback=self._cancel_callback,
         )
 
-        try:
-            self._standalone.run_startup_calibration()
-        except CalibrationError:
-            sys.exit("Gripper calibration failed")
+        if skip_calibration:
+            # DEBT, not a fix. Isaac's finger DOFs currently report a dead
+            # effort channel -- flat ~0.0003 N whether the finger is free or
+            # pinned against a hard stop, live-measured over a 28 s run and
+            # confirmed not a bridge-wide problem (arm DOFs in the same
+            # message carry real gravity torques) -- so _calibrate()'s
+            # present_load-based contact detection can never succeed against
+            # the live simulator and always exhausts its retries. Marking
+            # calibrated without running the real homing sequence unblocks
+            # bring-up and verification; it is not a substitute for a working
+            # contact source. Whoever adds one should delete this branch
+            # along with the isaac_skip_calibration parameter that gates it.
+            self._node.get_logger().warning(
+                f"Gripper {gripper_name!r}: skipping startup calibration "
+                "(isaac_skip_calibration debt bypass) -- present_position is "
+                "NOT physically homed."
+            )
+            self.gripper._calibrated = True
+        else:
+            try:
+                self._standalone.run_startup_calibration()
+            except CalibrationError:
+                sys.exit("Gripper calibration failed")
 
     def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
@@ -319,7 +346,11 @@ class ARGripperNode(Node):
             ),
         ).value
         if mock and isaac:
-            raise ValueError(
+            # sys.exit(message) prints the message and exits cleanly, no
+            # traceback -- matching the "Gripper calibration failed" startup
+            # failure below, and what a misconfigured launch argument should
+            # look like in the log instead of a raised exception's stack.
+            sys.exit(
                 "mock:=true and isaac:=true are mutually exclusive backends; pick one."
             )
 
@@ -361,14 +392,37 @@ class ARGripperNode(Node):
                     read_only=True,
                 ),
             ).value
+            isaac_skip_calibration = self.declare_parameter(
+                "isaac_skip_calibration",
+                False,
+                ParameterDescriptor(
+                    description=(
+                        "DEBT bring-up bypass, not a fix: mark the gripper "
+                        "calibrated without running the real homing sequence. "
+                        "Needed because Isaac's finger DOFs currently report a "
+                        "dead effort channel, so present_load-based contact "
+                        "detection can never succeed and real homing always "
+                        "fails. Delete this parameter once a working contact "
+                        "source lands."
+                    ),
+                    read_only=True,
+                ),
+            ).value
 
             self.get_logger().warn(
                 "ARGripper running in ISAAC mode: servo bus backed by Isaac Sim's "
                 "measured joint state (no serial hardware)"
             )
             # Route every serial device onto an in-process FakeServo bus, same
-            # hook the mock path uses. Done before the device opens
-            # (USB2FeetechDevice opens serial in __init__).
+            # hook the mock path uses -- but via install_fake_serial(None)
+            # directly rather than install_ros_node_loopback(), and done
+            # before the device opens (USB2FeetechDevice opens serial in
+            # __init__). install_ros_node_loopback() would ALSO swap
+            # gripper.py's `time` for FakeTime, collapsing INRUSH_TIME and the
+            # stall-detection baseline window to nothing -- fine against the
+            # mock's instant in-memory model, wrong here: this backend runs
+            # against a real-time simulator, where those waits need to cost
+            # real wall-clock time to mean anything.
             self._isaac_bus, _ = install_fake_serial(None)
 
             # Startup calibration below (inside the ARGripper() constructor)
@@ -389,8 +443,13 @@ class ARGripperNode(Node):
             )
             self._isaac_bootstrap_thread.start()
 
-        device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
         try:
+            # Inside the try (not above it): if this raises, the isaac
+            # bootstrap executor above has already started spinning this node
+            # on its own thread and must still be torn down in the finally
+            # below, or that thread is left spinning a node __init__ never
+            # finished building.
+            device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
             for gripper_name, servo_ids in gripper_params.items():
                 if len(servo_ids) != 1:
                     raise ValueError(
@@ -433,6 +492,7 @@ class ARGripperNode(Node):
                         else os.path.expanduser(servo_position_path.value)
                     ),
                     self,
+                    skip_calibration=isaac and isaac_skip_calibration,
                 )
                 self.all_servos.append(gripper.gripper.servo)
                 self._grippers.append(gripper)
@@ -447,6 +507,17 @@ class ARGripperNode(Node):
                 self._isaac_bootstrap_executor.remove_node(self)
                 self._isaac_bootstrap_executor.shutdown()
                 self._isaac_bootstrap_thread.join(timeout=2.0)
+                if self._isaac_bootstrap_thread.is_alive():
+                    # shutdown() didn't get the spin loop to exit in time --
+                    # it may still be spinning this node when main() adds it
+                    # to its own executor below. Loud rather than silent:
+                    # a second spinner on the same node is exactly the
+                    # double-callback hazard this whole bootstrap dance
+                    # exists to avoid.
+                    self.get_logger().error(
+                        "Isaac bootstrap executor thread did not stop within "
+                        "2s; it may still be spinning this node."
+                    )
 
         self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1
