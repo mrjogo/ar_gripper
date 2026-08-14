@@ -304,6 +304,24 @@ class ARGripperNode(Node):
                 read_only=True,
             ),
         ).value
+        isaac = self.declare_parameter(
+            "isaac",
+            False,
+            ParameterDescriptor(
+                description=(
+                    "Run against Isaac Sim's simulated finger joint instead of "
+                    "real serial hardware or the offline mock. The real driver, "
+                    "action, calibration and diagnostics code all run unchanged "
+                    "-- only the serial servo bus is backed by Isaac's measured "
+                    "joint state instead of an internal travel model."
+                ),
+                read_only=True,
+            ),
+        ).value
+        if mock and isaac:
+            raise ValueError(
+                "mock:=true and isaac:=true are mutually exclusive backends; pick one."
+            )
 
         self.all_servos = []
         self._grippers = []
@@ -319,6 +337,39 @@ class ARGripperNode(Node):
                 "(no serial hardware)"
             )
             self._mock_bus, _ = install_ros_node_loopback()
+
+        self._isaac_bus = None
+        if isaac:
+            from ar_gripper.mock import install_fake_serial
+            from ar_gripper.scripts.isaac_servo import IsaacJointBus, IsaacServo
+
+            isaac_joint_states_topic = self.declare_parameter(
+                "isaac_joint_states_topic",
+                "/isaac/joint_states",
+                ParameterDescriptor(
+                    description="Isaac joint-state topic the servo backend reads.",
+                    read_only=True,
+                ),
+            ).value
+            isaac_command_topic = self.declare_parameter(
+                "isaac_command_topic",
+                "/isaac/gripper/joint_commands",
+                ParameterDescriptor(
+                    description=(
+                        "Isaac joint-command topic the servo backend publishes."
+                    ),
+                    read_only=True,
+                ),
+            ).value
+
+            self.get_logger().warn(
+                "ARGripper running in ISAAC mode: servo bus backed by Isaac Sim's "
+                "measured joint state (no serial hardware)"
+            )
+            # Route every serial device onto an in-process FakeServo bus, same
+            # hook the mock path uses. Done before the device opens
+            # (USB2FeetechDevice opens serial in __init__).
+            self._isaac_bus, _ = install_fake_serial(None)
 
         device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
         for gripper_name, servo_ids in gripper_params.items():
@@ -337,11 +388,31 @@ class ARGripperNode(Node):
                 self._mock_bus[-1].servo(servo_ids[0]).load_sequence = list(
                     HOMING_LOAD_SEQUENCE
                 )
+            if isaac:
+                # Replace the default in-memory register file with one backed
+                # by Isaac before the Gripper constructor probes the bus.
+                # FakeSerial.servo() uses setdefault, so pre-seeding here is
+                # enough -- no change to mock.py is required. The joint name
+                # is spelled out because tf_prefix is empty in this
+                # deployment; if that ever changes, this is one of three
+                # places (with TurntableNode.JOINT_NAME and the xacro) that
+                # must change together.
+                joint_bus = IsaacJointBus(
+                    self,
+                    joint_states_topic=isaac_joint_states_topic,
+                    command_topic=isaac_command_topic,
+                    joint_name="primary_ar_gripper_body_finger1",
+                )
+                self._isaac_bus[-1].servos[servo_ids[0]] = IsaacServo(joint_bus)
             gripper = ARGripper(
                 device,
                 gripper_name,
                 servo_ids[0],
-                None if mock else os.path.expanduser(servo_position_path.value),
+                (
+                    None
+                    if (mock or isaac)
+                    else os.path.expanduser(servo_position_path.value)
+                ),
                 self,
             )
             self.all_servos.append(gripper.gripper.servo)
