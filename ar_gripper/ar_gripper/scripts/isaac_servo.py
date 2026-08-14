@@ -17,16 +17,14 @@ which is excluded from it, alongside ``ar_gripper.py``.
 """
 
 import threading
-from pathlib import Path
 from time import monotonic as _real_monotonic
 from time import sleep as _real_sleep
-from xml.etree import ElementTree
 
-from ament_index_python.packages import get_package_share_directory
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from sensor_msgs.msg import JointState
 
+from ar_gripper.description import finger_velocity_limit_mps
 from ar_gripper.gripper import Deadline
 from ar_gripper.mock import FakeServo
 
@@ -44,61 +42,6 @@ _TORQUE_LIMIT_ADDR = 0x30
 # IsaacServo.TICKS_PER_METRE for that would recreate exactly the coupling
 # those two addresses were pulled out here to avoid.
 _TICKS_PER_METRE = 78_900.0
-
-# The description this package owns and every consumer of the finger joint
-# shares -- Gazebo, MoveIt, the exported URDF Isaac's stage is built from, and
-# the ramp below. The joint is declared with a tf_prefix, so it is matched by
-# the unprefixed suffix.
-_DESCRIPTION_RELPATH = Path("urdf") / "ar_gripper_macro.xacro"
-_FINGER_JOINT_SUFFIX = "ar_gripper_body_finger1"
-
-
-def finger_velocity_limit_mps(description_path=None):
-    """Read the finger joint's ``<limit velocity="...">`` out of the description.
-
-    The ramp in ``IsaacJointBus`` must not publish targets faster than the
-    joint's own velocity limit, because that limit is also what Isaac clamps
-    the simulated joint to -- publish faster and the target simply runs ahead
-    of a joint that then catches up on its own schedule. That makes the limit a
-    number two subsystems have to agree on, and the description is the one that
-    already exists: copying it into a Python constant here would make this the
-    fourth place holding it (the two ``<limit>`` elements, the imported USD's
-    ``physxJoint:maxJointVelocity``, and a constant) and the first one to go
-    stale, since nothing would notice the disagreement.
-
-    The macro is read as plain XML rather than expanded through xacro: the
-    value is deliberately a literal there (see the comment above the joints),
-    expansion would pull in a build-time tool at node startup, and a literal
-    that stops being a literal should fail loudly here rather than be silently
-    re-derived. A non-numeric value therefore raises.
-    """
-    if description_path is None:
-        description_path = (
-            Path(get_package_share_directory("ar_gripper")) / _DESCRIPTION_RELPATH
-        )
-    root = ElementTree.parse(description_path).getroot()
-    for joint in root.iter("joint"):
-        name = joint.get("name") or ""
-        if not name.endswith(_FINGER_JOINT_SUFFIX):
-            continue
-        limit = joint.find("limit")
-        raw = limit.get("velocity") if limit is not None else None
-        if raw is None:
-            raise ValueError(
-                f"{description_path}: joint {name!r} has no <limit velocity=...>"
-            )
-        try:
-            return float(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"{description_path}: joint {name!r} has a non-literal velocity "
-                f"limit {raw!r}. This file is read as plain XML; either keep the "
-                "limit a literal or teach this reader to expand xacro."
-            ) from exc
-    raise ValueError(
-        f"{description_path}: no joint named *{_FINGER_JOINT_SUFFIX} to take a "
-        "velocity limit from"
-    )
 
 
 class RosClock:

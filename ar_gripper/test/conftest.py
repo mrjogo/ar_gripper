@@ -34,9 +34,13 @@ if str(_PKG_PARENT) not in sys.path:
 #
 # Overridden rather than defaulted, because the ambient domain is exactly the
 # hazard: inheriting a shell that happens to be pointed at a live stage is how
-# this happens. Derived from the pid so two concurrent runs cannot collide with
-# each other either, and kept clear of the domains this project uses by hand
-# (42 for the Isaac stage, 94 for the mock-motion launch test).
+# this happens. Kept clear of the domains this project drives by hand (42 for
+# the Isaac stage, 94 for the mock-motion launch test), which is the collision
+# that matters, since those are the ones with something actuated on the far
+# end. Spreading it over the pid makes two concurrent runs of this suite
+# unlikely to share a domain rather than guaranteed not to -- one in twenty --
+# and the cost of losing that coin toss is two test runs talking to each
+# other, not a robot moving.
 #
 # The environment is enough here, unlike this project's launch tests: rclpy
 # reads the domain when the context is initialised, which is inside the test

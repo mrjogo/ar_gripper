@@ -400,6 +400,7 @@ class ARGripperNode(Node):
         self._isaac_bus = None
         self._isaac_node = None
         self._isaac_executor = None
+        self._isaac_spin_thread = None
         self._stamp_clock = None
         if isaac:
             from ar_gripper import gripper as gripper_module
@@ -618,13 +619,15 @@ class ARGripperNode(Node):
             return
         self._isaac_executor.remove_node(self._isaac_node)
         self._isaac_executor.shutdown()
-        # is_alive() rather than a bare join(): construction can fail between
-        # creating the thread and starting it (add_node raising), and joining a
-        # thread that was never started is itself an error, which would then
-        # mask the failure that got us here.
-        if self._isaac_spin_thread.is_alive():
+        # Guarded, rather than joined outright: this runs on the failure path
+        # too, and joining a thread that was never started is itself an error,
+        # which would replace whatever failure got us here with a confusing
+        # one. The attribute is pre-initialised to None alongside the node and
+        # the executor so that the window between creating the thread and
+        # starting it is covered as well.
+        if self._isaac_spin_thread is not None and self._isaac_spin_thread.is_alive():
             self._isaac_spin_thread.join(timeout=2.0)
-        if self._isaac_spin_thread.is_alive():
+        if self._isaac_spin_thread is not None and self._isaac_spin_thread.is_alive():
             self.get_logger().error(
                 "Isaac executor thread did not stop within 2s; it may still be "
                 "spinning its node."
@@ -632,6 +635,7 @@ class ARGripperNode(Node):
         self._isaac_node.destroy_node()
         self._isaac_executor = None
         self._isaac_node = None
+        self._isaac_spin_thread = None
         self._stamp_clock = None
 
     def destroy_node(self):

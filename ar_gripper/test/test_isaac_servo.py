@@ -41,6 +41,7 @@ SID = 1
 JOINT_NAME = "primary_ar_gripper_body_finger1"
 # The description in the source tree, not the installed copy: this test is
 # about what the repository ships.
+_PACKAGE_DIR = Path(__file__).resolve().parents[1] / "ar_gripper"
 DESCRIPTION_PATH = (
     Path(__file__).resolve().parents[1] / "urdf" / "ar_gripper_macro.xacro"
 )
@@ -489,3 +490,39 @@ def test_the_bus_takes_its_velocity_ceiling_from_the_description_reader(monkeypa
     )
 
     assert bus.max_velocity_mps == sentinel
+
+
+def test_the_description_reader_loads_by_path_with_no_ros_available():
+    """The simulator stage loads this reader out of the checkout, by file path.
+
+    It runs inside Isaac's own interpreter, which must not have a ROS overlay
+    sourced, and it does that specifically so its staleness check and the
+    driver read the description through the same code instead of through two
+    parsers that can drift apart. That only works for as long as
+    ``ar_gripper/description.py`` stays importable with nothing but the
+    standard library -- so this loads it exactly the way the stage does, with
+    every ROS module poisoned and the package not on the path at all.
+    """
+    import subprocess
+    import sys
+
+    reader = _PACKAGE_DIR / "description.py"
+    code = (
+        "import importlib.util, sys\n"
+        "for m in ['rclpy', 'ament_index_python', 'sensor_msgs', 'rcl_interfaces']:\n"
+        "    sys.modules[m] = None\n"
+        f"spec = importlib.util.spec_from_file_location('d', r'{reader}')\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        f"print(module.finger_velocity_limit_mps(r'{DESCRIPTION_PATH}'))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={"PATH": ""},
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert float(result.stdout.strip()) == finger_velocity_limit_mps(DESCRIPTION_PATH)
