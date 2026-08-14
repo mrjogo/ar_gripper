@@ -18,6 +18,8 @@ which is excluded from it, alongside ``ar_gripper.py``.
 
 import threading
 from pathlib import Path
+from time import monotonic as _real_monotonic
+from time import sleep as _real_sleep
 from xml.etree import ElementTree
 
 from ament_index_python.packages import get_package_share_directory
@@ -25,6 +27,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from sensor_msgs.msg import JointState
 
+from ar_gripper.gripper import Deadline
 from ar_gripper.mock import FakeServo
 
 # Feetech register addresses for the two writes this backend needs to see but
@@ -124,8 +127,29 @@ class RosClock:
     def time(self):
         return self._clock.now().nanoseconds / 1e9
 
+    # How often the sleep below checks the simulated clock. Short relative to
+    # the shortest wait in gripper.py (its 5 ms inrush poll) so the sleep does
+    # not become the thing that sets the loop rate.
+    POLL_INTERVAL_S = 0.002
+
     def sleep(self, seconds):
-        self._clock.sleep_for(Duration(nanoseconds=int(seconds * 1e9)))
+        """Sleep ``seconds`` of simulated time, bounded in real time.
+
+        ``rclpy.clock.Clock.sleep_for`` is the obvious call and it is wrong
+        here, for a sharper version of the reason ``Deadline`` carries a
+        backstop: against a stopped simulator it never returns. A deadline at
+        least gets to notice it has expired; a thread blocked in
+        ``sleep_for`` cannot, so the wait built out of it hangs forever and
+        takes the action's lock with it. Polling the simulated clock with real
+        sleeps keeps the duration simulated while keeping the call bounded in
+        real time, using the same backstop factor the deadlines use.
+        """
+        target = self._clock.now() + Duration(nanoseconds=int(seconds * 1e9))
+        wall_expiry = _real_monotonic() + seconds * Deadline.WALL_BACKSTOP_FACTOR
+        while self._clock.now() < target:
+            if _real_monotonic() >= wall_expiry:
+                return
+            _real_sleep(min(self.POLL_INTERVAL_S, seconds))
 
 
 class IsaacJointBus:
@@ -338,11 +362,6 @@ class IsaacJointBus:
         # actually track -- publishing the unclamped rate just runs the target
         # ahead of the joint and leaves it to catch up on its own schedule
         # regardless.
-        with self._condition:
-            if not self._seeded:
-                return
-            goal = self._goal_m
-            rate = min(self._drive_speed_mps, self.max_velocity_mps)
         # The step is rate x MEASURED elapsed time, not rate / COMMAND_RATE_HZ.
         # A fixed step per tick only travels at `rate` if the timer actually
         # achieves COMMAND_RATE_HZ, and this one runs on the simulator's clock:
@@ -362,18 +381,31 @@ class IsaacJointBus:
         # uncapped interval would turn either into a single step that
         # teleports the target across the whole stroke.
         elapsed_s = min(max(elapsed_s, 0.0), self.MAX_RAMP_INTERVAL_S)
-        if rate <= 0.0:
-            self._published_m = goal
-        else:
-            step = rate * elapsed_s
-            delta = goal - self._published_m
-            self._published_m += (
-                delta if abs(delta) <= step else (step if delta > 0 else -step)
-            )
+        # _published_m is read and written under the same lock as everything
+        # else it is derived from. Today both writers happen to be on the one
+        # executor thread this bus is given, but the class does not get to
+        # assume that -- its own docstring says the caller chooses the node and
+        # the executor -- and an unlocked read-modify-write of the published
+        # target against a locked read of the goal is the kind of thing that
+        # only starts being wrong once someone changes that choice.
+        with self._condition:
+            if not self._seeded:
+                return
+            goal = self._goal_m
+            rate = min(self._drive_speed_mps, self.max_velocity_mps)
+            if rate <= 0.0:
+                self._published_m = goal
+            else:
+                step = rate * elapsed_s
+                delta = goal - self._published_m
+                self._published_m += (
+                    delta if abs(delta) <= step else (step if delta > 0 else -step)
+                )
+            published = self._published_m
         msg = JointState()
         msg.header.stamp = now.to_msg()
         msg.name.append(self._joint_name)
-        msg.position.append(self._published_m)
+        msg.position.append(published)
         self._command_pub.publish(msg)
 
 

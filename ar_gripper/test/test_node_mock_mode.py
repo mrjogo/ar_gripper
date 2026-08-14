@@ -89,3 +89,29 @@ def test_node_homes_and_grasps_in_mock_mode(tmp_path, restore_mock_patches):
         if node is not None:
             node.destroy_node()
         rclpy.shutdown()
+
+
+def test_the_action_server_does_not_share_the_nodes_default_callback_group(
+    tmp_path, restore_mock_patches
+):
+    """A grasp occupies its execute callback for as long as the move takes.
+
+    In the node's default MutuallyExclusiveCallbackGroup that would also hold
+    off the status, diagnostics and overload timers that share it, so
+    joint_states and diagnostics would go silent for the whole of every
+    grasp -- precisely when a consumer most wants to see them.
+    """
+    import ar_gripper.scripts.ar_gripper as nodemod
+
+    rclpy.init(args=["--ros-args", "--params-file", str(_write_params(tmp_path))])
+    node = None
+    try:
+        node = nodemod.ARGripperNode()
+        action_server = node._grippers[0]._action_server
+
+        assert action_server.callback_group is not None
+        assert action_server.callback_group is not node.default_callback_group
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()

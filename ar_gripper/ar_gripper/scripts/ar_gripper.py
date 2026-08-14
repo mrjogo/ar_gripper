@@ -618,7 +618,12 @@ class ARGripperNode(Node):
             return
         self._isaac_executor.remove_node(self._isaac_node)
         self._isaac_executor.shutdown()
-        self._isaac_spin_thread.join(timeout=2.0)
+        # is_alive() rather than a bare join(): construction can fail between
+        # creating the thread and starting it (add_node raising), and joining a
+        # thread that was never started is itself an error, which would then
+        # mask the failure that got us here.
+        if self._isaac_spin_thread.is_alive():
+            self._isaac_spin_thread.join(timeout=2.0)
         if self._isaac_spin_thread.is_alive():
             self.get_logger().error(
                 "Isaac executor thread did not stop within 2s; it may still be "

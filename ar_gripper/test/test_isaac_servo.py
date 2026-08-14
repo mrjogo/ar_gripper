@@ -465,3 +465,27 @@ def test_the_subscription_and_the_ramp_timer_get_their_own_callback_groups():
     assert node.subscription_group is not None
     assert node.timer_group is not None
     assert node.subscription_group is not node.timer_group
+
+
+def test_the_bus_takes_its_velocity_ceiling_from_the_description_reader(monkeypatch):
+    """Not just that the reader works and the clamp works -- that they are WIRED.
+
+    Both halves passing while the constructor quietly holds a literal is the
+    exact failure the derivation exists to prevent, and it is invisible for as
+    long as the literal happens to match the description.
+    """
+    from ar_gripper.scripts import isaac_servo
+
+    sentinel = 0.12345
+    monkeypatch.setattr(
+        isaac_servo, "finger_velocity_limit_mps", lambda *_args, **_kwargs: sentinel
+    )
+
+    bus = IsaacJointBus(
+        _StubNode(),
+        joint_states_topic="/isaac/joint_states",
+        command_topic="/isaac/gripper/joint_commands",
+        joint_name=JOINT_NAME,
+    )
+
+    assert bus.max_velocity_mps == sentinel

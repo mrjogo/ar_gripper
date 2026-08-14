@@ -50,6 +50,11 @@ SIM_PERIOD_S = 1.0 / 120.0
 # test to read as contact: IsaacServo maps newtons to percent of stall torque
 # against MAX_EFFORT_N (1041.25 N), so 200 N is ~19%.
 CONTACT_EFFORT_N = 200.0
+# Bound on ARGripperNode's constructor. Generous against the ~1-3 s a healthy
+# build takes, but it also has to sit above the longest legitimate failure:
+# a wait whose simulated clock has stopped gives up on Deadline's real-time
+# backstop, which for the 20 s homing move is 60 s.
+CONSTRUCTION_TIMEOUT_S = 90.0
 
 
 class _SimPublisher:
@@ -133,17 +138,47 @@ def isaac_driver_node(skip_calibration):
     original_time = gripper_module.time
     node = None
     try:
-        node = ARGripperNode(
-            parameter_overrides=[
-                Parameter("isaac", Parameter.Type.BOOL, True),
-                Parameter(
-                    "isaac_skip_calibration", Parameter.Type.BOOL, skip_calibration
-                ),
-                Parameter(
-                    "grippers", Parameter.Type.STRING, json.dumps({"primary": [0]})
-                ),
-            ]
-        )
+        # Built on a worker thread with a bounded join. Every failure mode this
+        # file is about presents as construction not returning -- a starved
+        # read, a clock that never advances, an executor that was never spun --
+        # and an unbounded constructor turns each of those into a CI job
+        # timeout with no failing test to point at, instead of a red test.
+        built = {}
+
+        def _build():
+            try:
+                built["node"] = ARGripperNode(
+                    parameter_overrides=[
+                        Parameter("isaac", Parameter.Type.BOOL, True),
+                        Parameter(
+                            "isaac_skip_calibration",
+                            Parameter.Type.BOOL,
+                            skip_calibration,
+                        ),
+                        Parameter(
+                            "grippers",
+                            Parameter.Type.STRING,
+                            json.dumps({"primary": [0]}),
+                        ),
+                    ]
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                built["error"] = exc
+
+        builder = threading.Thread(target=_build, daemon=True)
+        builder.start()
+        builder.join(timeout=CONSTRUCTION_TIMEOUT_S)
+        if builder.is_alive():
+            pytest.fail(
+                f"ARGripperNode(isaac) did not finish constructing within "
+                f"{CONSTRUCTION_TIMEOUT_S:g} s. Startup calibration runs inside the "
+                "constructor, so this means a blocking read or a sleep never "
+                "returned -- check that the isaac branch's executor is spinning "
+                "its node and that /clock is being serviced."
+            )
+        if "error" in built:
+            raise built["error"]
+        node = built["node"]
         yield node
     finally:
         if node is not None:
@@ -195,6 +230,12 @@ def test_blocking_reads_from_a_driver_callback_are_never_starved():
     subscription whose message has not been taken yet, burning the GIL that the
     pool thread doing the taking needs, so samples that arrived on time are
     delivered tens to hundreds of milliseconds late.
+
+    The behavioural half of that is timing-sensitive by nature -- measured at
+    around a third of runs catching the regression when the whole suite runs,
+    because whatever a preceding test warms up masks it -- so the arrangement
+    that produces the behaviour is asserted structurally first. That half
+    cannot be timing-dependent, and it is what actually pins the design.
     """
     reads = 40
     rclpy.init()
@@ -204,6 +245,17 @@ def test_blocking_reads_from_a_driver_callback_are_never_starved():
             # The IsaacServo behind the driver's FeetechSMSServo, and the bus
             # whose timeout counter is the measurement.
             bus = node._isaac_bus[-1].servos[0]._bus
+
+            # Structural: the simulator's traffic is on a node of its own, spun
+            # by a SingleThreadedExecutor of its own, and the driver node --
+            # the one with the MultiThreadedExecutor and the blocking
+            # callbacks -- subscribes to none of it.
+            assert node._isaac_node is not node
+            assert isinstance(node._isaac_executor, SingleThreadedExecutor)
+            assert node._isaac_node.executor is node._isaac_executor
+            driver_topics = {sub.topic_name for sub in node.subscriptions}
+            assert "/isaac/joint_states" not in driver_topics
+            assert "/clock" not in driver_topics
 
             ready = threading.Event()
             done = threading.Event()
