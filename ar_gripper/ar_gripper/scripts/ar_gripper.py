@@ -5,6 +5,7 @@ import os
 import sys
 from math import isclose
 from threading import Lock, Thread
+from time import monotonic, sleep
 
 import rclpy
 from ar_gripper_interfaces.srv import SetHoldingTorque
@@ -48,7 +49,6 @@ class ARGripper:
         servo_id,
         servo_position_path,
         node,
-        skip_calibration=False,
     ):
         self._node = node
         # Build the standalone WITHOUT calibrating yet, so the action/service
@@ -96,42 +96,19 @@ class ARGripper:
             callback_group=self._action_callback_group,
         )
 
-        if skip_calibration:
-            # DEBT, not a fix. Against Isaac, homing cannot use force at all:
-            # the finger's measured joint effort reports the joint's reaction
-            # to EXTERNAL loads, and a finger pressed against its own joint
-            # limit has no external load -- the drive force and the limit's
-            # reaction are internal to that joint and cancel exactly, so the
-            # near-zero reading is correct and the question is the wrong one.
-            # _calibrate()'s present_load-based contact detection therefore
-            # can never succeed there and always exhausts its retries. A hard
-            # stop is a constraint rather than a collision, so contact
-            # reporting cannot see it either; the mechanism that can is a
-            # velocity threshold plus a persistent position error, both
-            # already carried in the measured joint state.
-            #
-            # This branch flips the calibrated flag directly, which is NOT
-            # equivalent to homing: everything _calibrate() would establish on
-            # the way is left at whatever _init_servo left it at. Specifically
-            # unset are min_position_limit / max_position_limit (so nothing
-            # constrains a goal to the real stroke), position_correction and
-            # the encoder rezero (so present_position is an arbitrary offset
-            # from the real finger position rather than a homed one), and the
-            # calibration torque_limit. Whoever adds a working homing
-            # mechanism should delete this branch along with the
-            # isaac_skip_calibration parameter that gates it.
-            self._node.get_logger().warning(
-                f"Gripper {gripper_name!r}: skipping startup calibration "
-                "(isaac_skip_calibration debt bypass) -- present_position is NOT "
-                "physically homed, and the position limits, position correction "
-                "and calibration torque limit homing would set are unset."
-            )
-            self.gripper._calibrated = True
-        else:
-            try:
-                self._standalone.run_startup_calibration()
-            except CalibrationError:
-                sys.exit("Gripper calibration failed")
+        # Real homing, on every backend. Nothing here is allowed to shortcut it
+        # for the simulator: _calibrate() is also what establishes the position
+        # limits, the position correction and the calibration torque limit that
+        # the rest of the driver reads, so a backend that marked itself
+        # calibrated instead would have to hand-set all four -- a second
+        # implementation of the driver's own state setup, free to drift away
+        # from the real one. What the simulator needed to make this possible
+        # was a way to feel a hard stop that reports no force; see
+        # isaac_servo.StallDetector.
+        try:
+            self._standalone.run_startup_calibration()
+        except CalibrationError:
+            sys.exit("Gripper calibration failed")
 
     def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
@@ -429,27 +406,6 @@ class ARGripperNode(Node):
                     read_only=True,
                 ),
             ).value
-            isaac_skip_calibration = self.declare_parameter(
-                "isaac_skip_calibration",
-                False,
-                ParameterDescriptor(
-                    description=(
-                        "DEBT bring-up bypass, not a fix: mark the gripper "
-                        "calibrated without running the real homing sequence, "
-                        "leaving the position limits, position correction and "
-                        "torque limit that homing sets unset. Needed because a "
-                        "finger against its own joint limit exerts no external "
-                        "load, so the measured effort homing keys on is "
-                        "legitimately ~zero there and present_load-based "
-                        "contact detection can never succeed. Delete this "
-                        "parameter once homing gains a mechanism that works "
-                        "against a constraint (velocity threshold plus "
-                        "persistent position error)."
-                    ),
-                    read_only=True,
-                ),
-            ).value
-
             self.get_logger().warn(
                 "ARGripper running in ISAAC mode: servo bus backed by Isaac Sim's "
                 "measured joint state (no serial hardware)"
@@ -562,6 +518,7 @@ class ARGripperNode(Node):
                         joint_name="primary_ar_gripper_body_finger1",
                     )
                     self._isaac_bus[-1].servos[servo_ids[0]] = IsaacServo(joint_bus)
+                    self._wait_for_simulator(joint_bus)
                 gripper = ARGripper(
                     device,
                     gripper_name,
@@ -572,7 +529,6 @@ class ARGripperNode(Node):
                         else os.path.expanduser(servo_position_path.value)
                     ),
                     self,
-                    skip_calibration=isaac and isaac_skip_calibration,
                 )
                 self.all_servos.append(gripper.gripper.servo)
                 self._grippers.append(gripper)
@@ -612,6 +568,45 @@ class ARGripperNode(Node):
         self.create_timer(
             self.SERVO_OVERLOAD_CHECK_INTERVAL_S, self._check_servo_overload
         )
+
+    # How long startup waits for the simulator, in REAL seconds: this is the
+    # one wait that cannot be measured in simulated time, because what it is
+    # waiting for is the thing that makes simulated time advance. Generous,
+    # since the usual reason for waiting at all is that the driver was started
+    # while the stage was still coming up.
+    SIMULATOR_WAIT_S = 30.0
+    _SIMULATOR_POLL_S = 0.05
+
+    def _wait_for_simulator(self, joint_bus):
+        """Block until the simulator is publishing, before homing measures anything.
+
+        Two things have to have arrived, and neither of them is optional.
+
+        A joint state, because the first thing homing does is read the finger's
+        position, and a read with nothing on the far end can only time out.
+
+        And a ``/clock`` message, because until one arrives this node's sim-time
+        clock reads exactly zero -- and every wait in ``gripper.py`` is a
+        deadline on that clock. A deadline taken at zero against a simulator
+        that is already some way into its run expires the instant the real time
+        arrives, which surfaces as a 20 s homing move "timing out" three
+        seconds after it started, blaming the move for the clock.
+        """
+        deadline = monotonic() + self.SIMULATOR_WAIT_S
+        if not joint_bus.wait_for_first_sample(self.SIMULATOR_WAIT_S):
+            sys.exit(
+                "No /isaac/joint_states within "
+                f"{self.SIMULATOR_WAIT_S:g} s: no simulator to drive"
+            )
+        while self._isaac_node.get_clock().now().nanoseconds == 0:
+            if monotonic() >= deadline:
+                sys.exit(
+                    f"Simulated time still reads zero after "
+                    f"{self.SIMULATOR_WAIT_S:g} s: the simulator is publishing "
+                    "joint states but not /clock, so nothing the driver waits "
+                    "on can ever expire correctly"
+                )
+            sleep(self._SIMULATOR_POLL_S)
 
     def _shutdown_isaac_executor(self):
         """Stop the simulator node's private executor and its spin thread."""

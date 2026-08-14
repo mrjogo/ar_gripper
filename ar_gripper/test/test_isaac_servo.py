@@ -32,6 +32,7 @@ from ar_gripper.scripts.isaac_servo import (
     _DRIVE_SPEED_ADDR,
     IsaacJointBus,
     IsaacServo,
+    StallDetector,
     finger_velocity_limit_mps,
 )
 from builtin_interfaces.msg import Time
@@ -56,8 +57,9 @@ class _ScriptedIsaacJointBus:
     read the servo as many times as it likes.
     """
 
-    def __init__(self, samples):
+    def __init__(self, samples, stalled=False):
         self._samples = list(samples)
+        self.stalled = stalled
         self.wait_for_sample_calls = 0
         self.commands = []
         self.drive_params = []
@@ -90,10 +92,10 @@ def make_isaac_servo(fake_serials):
     from ar_gripper.feetech import USB2FeetechDevice
     from ar_gripper.gripper import Gripper
 
-    def _make(samples):
+    def _make(samples, stalled=False):
         device = USB2FeetechDevice("/dev/fake")
         fake = fake_serials[-1]
-        bus = _ScriptedIsaacJointBus(samples)
+        bus = _ScriptedIsaacJointBus(samples, stalled=stalled)
         isaac_servo = IsaacServo(bus)
         fake.servos[SID] = isaac_servo
         gripper = Gripper(device, "primary", SID)
@@ -197,8 +199,8 @@ def test_goal_position_becomes_a_metre_command(make_isaac_servo):
 
 
 class _HardStopIsaacBus:
-    """Chases the last commanded goal at a fixed rate, clamping at a hard stop
-    and reporting a stall force while pinned against it.
+    """Chases the last commanded goal at a fixed rate and clamps at a hard stop,
+    reporting **no force at all** while pinned against it.
 
     The metres-and-Isaac-samples analogue of ``FakeServo``'s own
     ``obstruction_ticks`` model (see ``test_mock_motor_current.py``), used
@@ -210,10 +212,21 @@ class _HardStopIsaacBus:
     go DOWN as metres go UP), so unlike ``FakeServo``'s own ticks-only
     obstruction (an upper bound, since ticks and "closing" increase together
     there) this one has to clamp from below.
+
+    The zero effort against the stop is the whole point of the fixture and not
+    a simplification: that is what the simulator reports there, and it is why
+    homing cannot be built on force. So this stub carries the shipped
+    ``StallDetector`` rather than a stall force of its own -- the rule under
+    test is the real one, and only the plant around it is fake.
+
+    Time comes from the driver's own module clock, which is the same clock the
+    real bus reads (a sim-time ``RosClock`` in the field, the deterministic
+    ``FakeTime`` here). A dwell has to be measured against the timeline the
+    driver paces its reads on, or a test can pass with a dwell no real homing
+    run would ever satisfy.
     """
 
     STEP_M = 0.001  # metres advanced per wait_for_sample() call
-    STALL_FORCE_N = 150.0  # -> present_load ~14.4, above the homing threshold of 10
 
     def __init__(self, closed_stop_m):
         self._closed_stop_m = closed_stop_m
@@ -222,8 +235,15 @@ class _HardStopIsaacBus:
         self._position_m = closed_stop_m + 0.03
         self._goal_m = self._position_m
         self.wait_for_sample_calls = 0
+        self._stall = StallDetector(
+            velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
+            position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
+            dwell_s=IsaacJointBus.STALL_DWELL_S,
+        )
 
     def wait_for_sample(self, timeout_s=None):
+        from ar_gripper import gripper as gripper_module
+
         self.wait_for_sample_calls += 1
         target = max(self._goal_m, self._closed_stop_m)
         delta = target - self._position_m
@@ -233,13 +253,15 @@ class _HardStopIsaacBus:
         else:
             moved = self.STEP_M if delta > 0 else -self.STEP_M
             self._position_m += moved
-        blocked = (
-            self._goal_m < self._closed_stop_m
-            and self._position_m == self._closed_stop_m
-        )
-        effort = self.STALL_FORCE_N if blocked else 0.0
         velocity = moved * 100.0  # nonzero while stepping, exactly 0.0 when settled
-        return self._position_m, velocity, effort
+        self._stall.update(
+            self._goal_m - self._position_m, velocity, gripper_module.time.time()
+        )
+        return self._position_m, velocity, 0.0
+
+    @property
+    def stalled(self):
+        return self._stall.stalled
 
     def command(self, position_m):
         self._goal_m = position_m
@@ -249,9 +271,17 @@ class _HardStopIsaacBus:
 
 
 def test_isaac_backed_calibration_converges(fake_serials, fast_clock):
-    """Same shape as test_mock_motor_current.py's
+    """Homing runs to completion against a stop that reports no force.
+
+    Same shape as test_mock_motor_current.py's
     test_calibrate_homes_against_an_obstruction, driven from Isaac-shaped
-    samples rather than the internal obstruction model.
+    samples rather than the internal obstruction model -- and with the load
+    channel that homing keys on fed by motion rather than by force, because
+    against a joint limit the simulator has no force to give it.
+
+    ``Gripper._calibrate`` is unmodified and unmodifiable here: it is the real
+    robot's homing sequence, shared with the hardware, and the substitution is
+    entirely below the driver, in what the simulated servo reports.
     """
     from ar_gripper.feetech import USB2FeetechDevice
     from ar_gripper.gripper import Gripper
@@ -263,6 +293,85 @@ def test_isaac_backed_calibration_converges(fake_serials, fast_clock):
 
     assert gripper.calibrate() is True
     assert gripper.calibrated is True
+
+
+def test_a_finger_that_reaches_its_target_is_never_called_stalled():
+    """The failure mode the two thresholds are jointly sized against.
+
+    A finger settling into a reachable target spends most of its travel time
+    creeping the last little way in -- the settle tail is around 70% of a
+    stroke -- so "slow" alone is not evidence of anything, and a rule that
+    treated it as evidence would report contact on every ordinary move. This
+    walks the drive's own first-order response all the way to rest, sampling
+    it at the publish rate, and asserts the detector stays quiet through every
+    one of those samples.
+    """
+    detector = StallDetector(
+        velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
+        position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
+        dwell_s=IsaacJointBus.STALL_DWELL_S,
+    )
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+    tau = 0.62  # the drive's real time constant, not the conservative one
+    error = 0.019  # the lag a full-speed ramp leaves behind it
+
+    for step in range(int(30.0 / dt)):
+        velocity = error / tau
+        assert not detector.update(error, velocity, step * dt), (
+            f"a freely settling finger was called stalled at t={step * dt:.2f} s, "
+            f"error {error * 1e3:.3f} mm, velocity {velocity * 1e3:.3f} mm/s"
+        )
+        error -= velocity * dt
+    assert error < 1e-9  # the trace really did settle, rather than stopping short
+
+
+def test_a_finger_held_off_its_target_is_called_stalled_after_the_dwell():
+    detector = StallDetector(
+        velocity_threshold_mps=IsaacJointBus.STALL_VELOCITY_MPS,
+        position_error_m=IsaacJointBus.STALL_POSITION_ERROR_M,
+        dwell_s=IsaacJointBus.STALL_DWELL_S,
+    )
+    error = 2 * IsaacJointBus.STALL_POSITION_ERROR_M
+    dwell = IsaacJointBus.STALL_DWELL_S
+
+    assert not detector.update(error, 0.0, 0.0)
+    assert not detector.update(error, 0.0, dwell / 2)
+    assert detector.update(error, 0.0, dwell)
+    # And releases the moment the joint gets going again, so a move that was
+    # blocked and then freed does not keep reporting contact.
+    assert not detector.update(error, IsaacJointBus.STALL_VELOCITY_MPS, dwell + 0.01)
+
+
+def test_the_stall_reaches_the_driver_as_load_and_as_current(make_isaac_servo):
+    """Both of the driver's load-shaped questions, from the one hook.
+
+    Homing reads ``present_load`` and the grasp loop reads ``present_current``.
+    Feeding the stall through ``_contact_load`` is what keeps those two
+    agreeing; overriding ``_load_now`` alone would leave the current model
+    reporting an unloaded servo during a stall.
+    """
+    gripper, _bus, _isaac = make_isaac_servo([(0.0, 0.0, 0.0)], stalled=True)
+
+    assert gripper.servo.present_load >= 10  # what _calibrate calls contact
+    assert gripper.servo.present_current > IsaacServo.NO_LOAD_CURRENT_MA
+
+    free, _bus, _isaac = make_isaac_servo([(0.0, 0.0, 0.0)], stalled=False)
+    assert free.servo.present_load == 0
+    assert free.servo.present_current == pytest.approx(
+        IsaacServo.NO_LOAD_CURRENT_MA, abs=IsaacServo.CURRENT_LSB_MA
+    )
+
+
+def test_a_squeezed_object_still_reports_its_force(make_isaac_servo):
+    """The stall must not displace the effort channel, only stand in where it
+    has nothing to say. An object between the fingers IS an external load, so
+    it reports as force, and a stall reading on top of it must not shrink a
+    contact force that is larger.
+    """
+    hard = IsaacServo.MAX_EFFORT_N / 2
+    gripper, _bus, _isaac = make_isaac_servo([(0.0, 0.0, hard)], stalled=True)
+
+    assert gripper.servo.present_load == pytest.approx(50.0)
 
 
 def test_drive_speed_conversion_undoes_the_wire_50x_encoding():
@@ -450,6 +559,39 @@ def test_the_first_sample_seeds_the_goal_instead_of_commanding_a_full_close():
     node.timer_callback()
 
     assert node.published.messages[-1].position[0] == pytest.approx(0.019)
+
+
+def test_the_bus_reports_a_stall_against_the_target_it_publishes():
+    """Not just that the rule works -- that the bus feeds it the right two
+    numbers. The error has to be measured against the target the ramp has
+    actually published, because the goal can be a whole stroke ahead of it
+    while the ramp is still paying it out, and measuring against that would
+    report a stall on every long move.
+
+    The stub node's clock advances one publish period per call, so a sample
+    costs the dwell exactly one tick's worth of time.
+    """
+    bus, node = make_bus()
+    node.subscription_callback(sample(0.0))
+    bus.set_drive_parameter(_DRIVE_SPEED_ADDR, 2450)
+    # A goal a whole stroke away, with the ramp only one tick into paying it
+    # out: the joint is stationary and nowhere near its goal, and this is
+    # exactly the moment a naive rule reports contact.
+    bus.command(-0.05)
+    node.timer_callback()
+    node.timer_callback()
+    node.subscription_callback(sample(0.0))
+    assert bus.stalled is False
+
+    # Let the ramp run past the joint, holding the joint still, and the same
+    # samples become a stall once the published target is out of reach for
+    # longer than the dwell.
+    for _ in range(
+        int(2 * IsaacJointBus.STALL_DWELL_S * IsaacJointBus.COMMAND_RATE_HZ)
+    ):
+        node.timer_callback()
+        node.subscription_callback(sample(0.0))
+    assert bus.stalled is True
 
 
 def test_the_subscription_and_the_ramp_timer_get_their_own_callback_groups():

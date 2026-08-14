@@ -95,6 +95,79 @@ class RosClock:
             _real_sleep(min(self.POLL_INTERVAL_S, seconds))
 
 
+class StallDetector:
+    """Contact detection from motion, for a joint whose effort cannot show it.
+
+    Isaac's measured joint effort is the joint's reaction to *external* loads,
+    and a finger pressed against its own joint limit has none: the drive force
+    and the limit's reaction are internal to that joint and cancel exactly. It
+    measures flat at +0.0003 N over 5486 samples, identical free-running and
+    pinned, and still 0.0004 N with 0.45 m of commanded drive error (~23 N at
+    the finger's 52 N/m drive). The reading is not missing and there is no
+    switch that turns it on -- force is simply the wrong question to ask of a
+    joint limit. Contact reporting cannot answer it either, because a limit is
+    a constraint rather than a collision.
+
+    So contact is detected the way NVIDIA's own ``snap_to_limits`` sample
+    detects a joint that has run into something: a velocity threshold plus a
+    persistent position error, both of which already ride in the joint state
+    that is published anyway. The joint is stalled when it is commanded
+    somewhere it is not going -- the target is further than
+    ``position_error_m`` away while the joint moves slower than
+    ``velocity_threshold_mps`` -- and stays that way for ``dwell_s``.
+
+    The two thresholds are deliberately not independent, and that coupling is
+    what makes the rule safe against the case it would otherwise get wrong: a
+    finger that is merely *slow* because it is still settling. The drive is
+    heavily overdamped (mass 0.04 kg against 52 N/m and 32 N*s/m), so its
+    approach to a reachable target is first order, and first-order lag ties the
+    two signals together exactly -- error = velocity * tau. A finger that is
+    only settling and is slower than the velocity threshold is therefore within
+    ``velocity_threshold_mps * tau`` of its target *by construction* and cannot
+    be further away, at any point of the settle tail. Setting the error
+    threshold to a multiple of that lag makes the two halves jointly
+    unsatisfiable for free settling, which is the guarantee the dwell would
+    otherwise have to provide by being longer than the tail itself.
+
+    What the dwell is left doing is rejecting noise: a single sample pair that
+    lands under one threshold and over the other must not latch a stall.
+
+    Honest about what this is: emulation, not physics. Homing against a
+    simulator exercises the driver's *sequencing*, not its stall detection, so
+    a stall bug that only appears against real servo current will not be caught
+    here. The reason to run homing in simulation anyway is that ``_calibrate()``
+    is also what establishes the position limits, the position correction and
+    the calibration torque limit that the rest of the driver reads; skipping it
+    means hand-setting all four, which is a second implementation of the
+    driver's own state setup, free to drift away from the real one.
+    """
+
+    def __init__(self, velocity_threshold_mps, position_error_m, dwell_s):
+        self.velocity_threshold_mps = velocity_threshold_mps
+        self.position_error_m = position_error_m
+        self.dwell_s = dwell_s
+        self._since_s = None
+        self.stalled = False
+
+    def update(self, position_error_m, velocity_mps, now_s):
+        """Fold one sample in and return whether the joint is stalled."""
+        holding = (
+            abs(velocity_mps) < self.velocity_threshold_mps
+            and abs(position_error_m) > self.position_error_m
+        )
+        if not holding:
+            self._since_s = None
+            self.stalled = False
+            return self.stalled
+        # A clock that jumps backwards restarts the dwell rather than
+        # completing it instantly: sim time restarts at zero on a stage reload,
+        # and "stalled" is not the thing to report about a reloaded stage.
+        if self._since_s is None or now_s < self._since_s:
+            self._since_s = now_s
+        self.stalled = (now_s - self._since_s) >= self.dwell_s
+        return self.stalled
+
+
 class IsaacJointBus:
     """Owns the joint-state subscription and joint-command publisher.
 
@@ -137,6 +210,40 @@ class IsaacJointBus:
     # stall behind a slow grasp).
     _RTF_FLOOR = 0.68
     DEFAULT_TIMEOUT_S = 5.0 / (COMMAND_RATE_HZ * _RTF_FLOOR)
+
+    # -- stall thresholds (see StallDetector for why motion, not force) --------------
+    #
+    # Settling time constant of the simulated finger drive, damping/stiffness,
+    # which the stage that authors those gains reports at startup. 0.62 s at
+    # the gains the asset carries; the stage lowers the drive when a run asks
+    # for a physics rate below the one it was authored for, which *raises* the
+    # time constant, to ~1.25 s at the lowest supported rate. The higher figure
+    # is used because over-estimating is the safe direction here: it widens the
+    # error threshold below, and a wider threshold can only ever be slower to
+    # call a stall, never quicker to call one falsely.
+    FINGER_DRIVE_TAU_S = 1.25
+    # "Not moving": one encoder tick per published sample. Below this the
+    # finger cannot move a single count of the position register between two
+    # consecutive joint states, i.e. it is motion the driver's own resolution
+    # cannot see. (IsaacServo.MOVING_DEADBAND_MPS is a different and much
+    # smaller number, for a different question -- what the servo's moving_sign
+    # register reports, which the driver uses to decide a move has ended.)
+    STALL_VELOCITY_MPS = COMMAND_RATE_HZ / _TICKS_PER_METRE
+    # How much further than a settling finger's own lag the target has to be
+    # before that gap counts as something holding the finger back. At the
+    # velocity threshold a freely settling finger is exactly
+    # STALL_VELOCITY_MPS * FINGER_DRIVE_TAU_S from its target, so this margin
+    # is the whole distance between "still arriving" and "stopped short", and
+    # it is spent on the second-order transient the first-order model leaves
+    # out, on the mimic constraint's own compliance, and on velocity noise.
+    STALL_LAG_MARGIN = 4.0
+    STALL_POSITION_ERROR_M = STALL_LAG_MARGIN * STALL_VELOCITY_MPS * FINGER_DRIVE_TAU_S
+    # Long enough that no single sample can latch a stall (~24 samples at the
+    # publish rate), and bounded above by the driver: Gripper._wait_for_stop
+    # returns three _WAIT_CHECK_TIME_S apart once the finger stops, and the
+    # homing loop reads the load immediately after it does, so a dwell longer
+    # than 0.3 s spends one of homing's three attempts every time.
+    STALL_DWELL_S = 0.2
 
     def __init__(
         self,
@@ -188,6 +295,17 @@ class IsaacJointBus:
         # the driver writes one, the ramp jumps straight to the goal, same as
         # FakeServo's own default travel model.
         self._drive_speed_mps = 0.0
+        # Contact detection, from the commanded target and the measured joint
+        # state -- the effort channel cannot see a finger against its own limit
+        # at all. Updated on every incoming sample rather than on the driver's
+        # reads, so the dwell is measured over the rate Isaac actually
+        # publishes at instead of over however often the driver happens to look.
+        self._stall = StallDetector(
+            velocity_threshold_mps=self.STALL_VELOCITY_MPS,
+            position_error_m=self.STALL_POSITION_ERROR_M,
+            dwell_s=self.STALL_DWELL_S,
+        )
+
         # Raw 0.1%/LSB register word from the last TORQUE_LIMIT (0x30) write.
         # No Isaac analogue yet -- recorded for a future finger-drive
         # maxForce scale, not acted on.
@@ -238,8 +356,29 @@ class IsaacJointBus:
                 self._goal_m = position
                 self._published_m = position
                 self._seeded = True
+            # Against the *published* target, not the goal: the published one
+            # is what Isaac's drive is tracking, and the goal can be a whole
+            # stroke ahead of it while the ramp is still paying it out, which
+            # would read as a stall on every long move.
+            self._stall.update(
+                self._published_m - position,
+                velocity,
+                self._node.get_clock().now().nanoseconds / 1e9,
+            )
             self._seq += 1
             self._condition.notify_all()
+
+    def wait_for_first_sample(self, timeout_s):
+        """Block until the simulator has published one joint state. True if it did.
+
+        Startup only, and nothing like ``wait_for_sample``: this one answers
+        "is there a simulator on the other end at all", so it does not count a
+        timeout against the bus and it is bounded in *real* time -- a
+        simulator that has not published yet has not published a clock either,
+        so there is no simulated time to bound it in.
+        """
+        with self._condition:
+            return self._condition.wait_for(lambda: self._seeded, timeout=timeout_s)
 
     def wait_for_sample(self, timeout_s=None):
         """Block for a **new** ``/isaac/joint_states`` sample and return it.
@@ -265,6 +404,17 @@ class IsaacJointBus:
                     throttle_duration_sec=5.0,
                 )
             return self._position_m, self._velocity_mps, self._effort_n
+
+    @property
+    def stalled(self):
+        """True while the finger is commanded somewhere it is not going.
+
+        The one thing standing in for the servo's load register during homing:
+        see ``StallDetector`` for why the simulator's effort channel cannot
+        answer that question about a joint limit.
+        """
+        with self._condition:
+            return self._stall.stalled
 
     def command(self, position_m):
         """Set the goal the ramp in ``_publish_ramped_target`` drives toward."""
@@ -360,6 +510,10 @@ class IsaacServo(FakeServo):
     load, and the rule that static registers never block -- is inherited.
     Only the source of the numbers changes, so the offline tests over the
     base class cover the encoding for this class too.
+
+    Position comes from the measured joint state directly. Load has two
+    sources, because the simulator can only see one of the two kinds of
+    contact as force -- see ``_contact_load``.
     """
 
     # No FakeServo constants exist for these two; they are private on a
@@ -381,7 +535,20 @@ class IsaacServo(FakeServo):
     # the finger toward 0.0 m instead of toward the open stop.
     CLOSED_POSITION_TICKS = 4095  # == Gripper._POSITION_MAX
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
-    LOAD_DEADBAND_N = 2.0  # below this the joint counts as unloaded
+    # Below this the joint counts as unloaded. Measured against a real grasp,
+    # this is currently above every force the simulated gripper can produce:
+    # closing on a 40 mm rigid box reads -0.835 N on this joint and -0.790 N on
+    # the mimic finger (they sum to the 1.63 N the drive develops at 31 mm of
+    # position error), against +0.0003 N free-running -- a clean signal 2700x
+    # the noise floor, and still under half of this threshold. The simulated
+    # drive's ceiling is the reason: 52 N/m over a 50 mm stroke cannot exceed
+    # 2.6 N, where a 400 g glass on a condensation-wet counterface needs ~4.4 N.
+    # Raising that ceiling (the drive's stable stiffness scales with 1/dt^2, so
+    # it follows the physics rate) is what makes this threshold worth
+    # re-deriving; lowering it before then would only report a load nothing
+    # acts on, since 0.835 N is 0.08% of stall torque against a homing test at
+    # 10%.
+    LOAD_DEADBAND_N = 2.0
     MOVING_DEADBAND_MPS = 1.0e-4  # below this, moving_sign reads 0 (stopped)
 
     def __init__(self, bus):
@@ -392,10 +559,12 @@ class IsaacServo(FakeServo):
         self._bus = bus
         self._tick_offset = 0.0
         self._sample = None
+        self._stalled = False
 
     # -- the one seam: every live read pulls a fresh Isaac sample --------------------
     def _advance(self):
         self._sample = self._bus.wait_for_sample()
+        self._stalled = self._bus.stalled
         position_m, _velocity, _effort = self._sample
         self.present_position_value = round(
             self.CLOSED_POSITION_TICKS
@@ -408,14 +577,33 @@ class IsaacServo(FakeServo):
 
         Feeds the inherited current model as well as present_load, so the two
         cannot disagree (mock.FakeServo._current_ma() calls this directly,
-        not _load_now()).
+        not _load_now()). It is also the single hook the driver's two
+        load-shaped questions come through -- ``present_load``, which homing
+        reads, and ``present_current``, which the grasp loop reads -- which is
+        why the stall below is folded in here rather than at either one of
+        them.
+
+        Two sources, because the simulator reports the two kinds of contact
+        through different channels. An object squeezed between the fingers is
+        an external load and shows up in the measured effort; the finger's own
+        travel limit is not, and shows up only as a target the joint is not
+        reaching (see ``StallDetector``). Whichever reads higher wins, so
+        neither kind of contact can be masked by the other being absent.
+
+        The stall reports the same percentage the offline mock's obstruction
+        model does (``FakeServo.stall_load``), so "pressed against a hard stop"
+        means one number across both backends rather than two that have to be
+        kept in step.
         """
         if self._sample is None:
             return 0.0
         force_n = abs(self._sample[2])
-        if force_n < self.LOAD_DEADBAND_N:
-            return 0.0
-        return min(force_n / self.MAX_EFFORT_N * 100.0, 100.0)
+        load = (
+            0.0
+            if force_n < self.LOAD_DEADBAND_N
+            else min(force_n / self.MAX_EFFORT_N * 100.0, 100.0)
+        )
+        return max(load, self.stall_load) if self._stalled else load
 
     def _load_now(self):
         return self._contact_load()

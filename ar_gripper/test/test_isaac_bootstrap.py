@@ -43,13 +43,16 @@ from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import JointState
 
 JOINT_NAME = "primary_ar_gripper_body_finger1"
+COMMAND_TOPIC = "/isaac/gripper/joint_commands"
 # Isaac's own publish rate for both topics (barbot_stage.py ticks the bridge
 # graph at the physics rate), so the load here is the load in the field.
 SIM_PERIOD_S = 1.0 / 120.0
-# Enough external load for Gripper._calibrate's `present_load < 10` contact
-# test to read as contact: IsaacServo maps newtons to percent of stall torque
-# against MAX_EFFORT_N (1041.25 N), so 200 N is ~19%.
-CONTACT_EFFORT_N = 200.0
+# The finger's travel limits and the settling time constant of the drive that
+# moves it, as the simulated asset carries them -- the closed stop is what
+# homing runs into, and the time constant is what makes that take a while.
+CLOSED_STOP_M = 0.0
+OPEN_STOP_M = 0.05
+FINGER_TAU_S = 0.62
 # Bound on ARGripperNode's constructor. Generous against the ~1-3 s a healthy
 # build takes, but it also has to sit above the longest legitimate failure:
 # a wait whose simulated clock has stopped gives up on Deadline's real-time
@@ -64,13 +67,24 @@ class _SimPublisher:
     without this nothing in the driver's clock ever advances) and
     ``/isaac/joint_states``, from a plain thread rather than a ROS timer so it
     keeps running while the node under test is blocked.
+
+    The finger it publishes is a plant, not a script: it chases the commanded
+    target with the drive's own first-order response and stops dead at the
+    closed travel limit. That is what lets startup homing actually run here.
+    And it reports **zero effort throughout**, including while pinned against
+    that limit, because that is what the simulator does -- a joint pressed
+    against its own limit has no external load for the effort channel to
+    report. Homing converging against this plant is therefore a real result
+    and not an artefact of the stand-in being generous.
     """
 
-    def __init__(self, node, contact_effort_for_s=0.0):
+    def __init__(self, node):
         self._clock_pub = node.create_publisher(Clock, "/clock", 10)
         self._state_pub = node.create_publisher(JointState, "/isaac/joint_states", 10)
-        self._contact_effort_for_s = contact_effort_for_s
+        node.create_subscription(JointState, COMMAND_TOPIC, self._on_command, 10)
         self.position_m = 0.019
+        self.velocity_mps = 0.0
+        self._target_m = self.position_m
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -81,10 +95,24 @@ class _SimPublisher:
         self._stop.set()
         self._thread.join(timeout=5.0)
 
+    def _on_command(self, msg):
+        if JOINT_NAME in msg.name:
+            self._target_m = msg.position[msg.name.index(JOINT_NAME)]
+
+    def _step(self, dt_s):
+        previous = self.position_m
+        moved = (self._target_m - previous) * dt_s / FINGER_TAU_S
+        self.position_m = min(max(previous + moved, CLOSED_STOP_M), OPEN_STOP_M)
+        self.velocity_mps = (self.position_m - previous) / dt_s
+
     def _run(self):
         started = time.monotonic()
+        last = started
         while not self._stop.is_set():
-            elapsed = time.monotonic() - started
+            now = time.monotonic()
+            elapsed = now - started
+            self._step(max(now - last, 1e-6))
+            last = now
             clock_msg = Clock()
             clock_msg.clock.sec = int(elapsed)
             clock_msg.clock.nanosec = int((elapsed % 1.0) * 1e9)
@@ -93,19 +121,17 @@ class _SimPublisher:
             state_msg = JointState()
             state_msg.name = [JOINT_NAME]
             state_msg.position = [self.position_m]
-            state_msg.velocity = [0.0]
-            state_msg.effort = [
-                CONTACT_EFFORT_N if elapsed < self._contact_effort_for_s else 0.0
-            ]
+            state_msg.velocity = [self.velocity_mps]
+            state_msg.effort = [0.0]
             self._state_pub.publish(state_msg)
             time.sleep(SIM_PERIOD_S)
 
 
 @contextmanager
-def simulator(contact_effort_for_s=0.0):
+def simulator():
     """Run the stand-in simulator on its own node and executor."""
     node = rclpy.create_node("test_isaac_sim")
-    publisher = _SimPublisher(node, contact_effort_for_s=contact_effort_for_s)
+    publisher = _SimPublisher(node)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -122,7 +148,7 @@ def simulator(contact_effort_for_s=0.0):
 
 
 @contextmanager
-def isaac_driver_node(skip_calibration):
+def isaac_driver_node():
     """Build the real ``ARGripperNode`` on the isaac backend and tear it down.
 
     The isaac branch deliberately patches process-global state (the serial
@@ -150,11 +176,6 @@ def isaac_driver_node(skip_calibration):
                 built["node"] = ARGripperNode(
                     parameter_overrides=[
                         Parameter("isaac", Parameter.Type.BOOL, True),
-                        Parameter(
-                            "isaac_skip_calibration",
-                            Parameter.Type.BOOL,
-                            skip_calibration,
-                        ),
                         Parameter(
                             "grippers",
                             Parameter.Type.STRING,
@@ -201,12 +222,7 @@ def test_startup_calibration_completes_inside_the_node_constructor():
 
     rclpy.init()
     try:
-        # Hold contact load long enough for the homing loop's first read to see
-        # it, then drop to zero so the retreat loop can converge.
-        with (
-            simulator(contact_effort_for_s=1.0),
-            isaac_driver_node(skip_calibration=False) as node,
-        ):
+        with simulator(), isaac_driver_node() as node:
             assert node._grippers[0].gripper.calibrated is True
             # Sim time, not wall time: the driver's clock is the simulator
             # node's clock, and it only advances because /clock is published
@@ -240,7 +256,7 @@ def test_blocking_reads_from_a_driver_callback_are_never_starved():
     reads = 40
     rclpy.init()
     try:
-        with simulator(), isaac_driver_node(skip_calibration=True) as node:
+        with simulator(), isaac_driver_node() as node:
             servo = node._grippers[0].gripper.servo
             # The IsaacServo behind the driver's FeetechSMSServo, and the bus
             # whose timeout counter is the measurement.
