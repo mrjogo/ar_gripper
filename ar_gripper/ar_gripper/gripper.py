@@ -25,6 +25,15 @@ class Gripper:
     _CALIBRATION_TORQUE = 10
 
     _WAIT_CHECK_TIME_S = 0.1
+    # The inrush wait in _goto_position has nothing to read and nothing to do,
+    # so it yields between checks instead of spinning. A bare `continue` loop
+    # holds the GIL for whole scheduler quanta at a time, which on the ROS node
+    # starves every other Python thread in the process for the length of the
+    # window -- measured as the joint-state subscription callback not running
+    # within 61 ms of a message that had already arrived on time. Much shorter
+    # than _WAIT_CHECK_TIME_S because this one only has to bound the overshoot
+    # past INRUSH_TIME.
+    _INRUSH_POLL_TIME_S = 0.005
 
     def __init__(self, device, name, servo_id):
         self.name = name
@@ -287,6 +296,7 @@ class Gripper:
                 break
             # Wait for initial current spike to subside
             if time.time() - move_start < INRUSH_TIME:
+                time.sleep(self._INRUSH_POLL_TIME_S)
                 continue
             current = self.servo.present_current
             # Accumulate samples to average for baseline

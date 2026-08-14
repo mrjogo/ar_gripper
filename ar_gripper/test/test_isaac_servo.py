@@ -11,18 +11,39 @@ rezero's tick offset survives, that a goal position becomes a metre command
 without the fake's "instantly reaches target" leaking through, and that
 ``IsaacJointBus.set_drive_parameter`` undoes the wire's steps/s // 50 encoding.
 
-No rclpy, no Isaac: driven by a fake ``IsaacJointBus`` whose ``wait_for_sample``
-pops scripted ``(position_m, velocity_mps, effort_N)`` tuples and whose
-``command`` / ``set_drive_parameter`` just record.
+It also covers ``IsaacJointBus`` itself where that needs no simulator: where
+the ramp's speed ceiling comes from, that the ramp respects it, that the first
+measured sample seeds the goal, and that the subscription and the ramp timer
+are wired into separate callback groups.
+
+No rclpy node, no Isaac: the servo tests are driven by a fake
+``IsaacJointBus`` whose ``wait_for_sample`` pops scripted ``(position_m,
+velocity_mps, effort_N)`` tuples and whose ``command`` /
+``set_drive_parameter`` just record, and the bus tests run the real
+``IsaacJointBus`` constructor against a stub node.
 """
 
 import threading
+from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
-
-from ar_gripper.scripts.isaac_servo import _DRIVE_SPEED_ADDR, IsaacJointBus, IsaacServo
+from ar_gripper.scripts.isaac_servo import (
+    _DRIVE_SPEED_ADDR,
+    IsaacJointBus,
+    IsaacServo,
+    finger_velocity_limit_mps,
+)
+from builtin_interfaces.msg import Time
+from sensor_msgs.msg import JointState
 
 SID = 1
+JOINT_NAME = "primary_ar_gripper_body_finger1"
+# The description in the source tree, not the installed copy: this test is
+# about what the repository ships.
+DESCRIPTION_PATH = (
+    Path(__file__).resolve().parents[1] / "urdf" / "ar_gripper_macro.xacro"
+)
 
 
 class _ScriptedIsaacJointBus:
@@ -264,3 +285,183 @@ def test_drive_speed_conversion_undoes_the_wire_50x_encoding():
     bus.set_drive_parameter(_DRIVE_SPEED_ADDR, 2450)  # wire word for 122500 steps/s
 
     assert bus._drive_speed_mps == pytest.approx(122500 / IsaacServo.TICKS_PER_METRE)
+
+
+class _StubPublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
+
+
+class _StubTime:
+    def __init__(self, seconds):
+        self.nanoseconds = int(seconds * 1e9)
+
+    def to_msg(self):
+        return Time()
+
+
+class _StubNode:
+    """The slice of ``rclpy.node.Node`` ``IsaacJointBus.__init__`` actually uses.
+
+    Enough to run the real constructor -- so these tests exercise the shipped
+    wiring rather than a hand-assembled object that can drift away from it --
+    without an rclpy context, an executor or a running simulator.
+    """
+
+    def __init__(self):
+        self.published = _StubPublisher()
+        self.subscription_callback = None
+        self.subscription_group = None
+        self.timer_callback = None
+        self.timer_group = None
+        self.timer_period_s = None
+        self.warnings = []
+        self.clock_s = 0.0
+
+    def create_publisher(self, _msg_type, _topic, _qos):
+        return self.published
+
+    def create_subscription(
+        self, _msg_type, _topic, callback, _qos, callback_group=None
+    ):
+        self.subscription_callback = callback
+        self.subscription_group = callback_group
+        return object()
+
+    def create_timer(self, period_s, callback, callback_group=None):
+        self.timer_period_s = period_s
+        self.timer_callback = callback
+        self.timer_group = callback_group
+        return object()
+
+    def get_clock(self):
+        return self
+
+    def now(self):
+        """Advance one ramp tick per call, so the ramp integrates a known step."""
+        self.clock_s += 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+        return _StubTime(self.clock_s)
+
+    def get_logger(self):
+        return self
+
+    def warning(self, message, **_kwargs):
+        self.warnings.append(message)
+
+
+def make_bus(max_velocity_mps=0.031):
+    node = _StubNode()
+    bus = IsaacJointBus(
+        node,
+        joint_states_topic="/isaac/joint_states",
+        command_topic="/isaac/gripper/joint_commands",
+        joint_name=JOINT_NAME,
+        max_velocity_mps=max_velocity_mps,
+    )
+    return bus, node
+
+
+def sample(position_m, velocity_mps=0.0, effort_n=0.0):
+    msg = JointState()
+    msg.name = [JOINT_NAME]
+    msg.position = [position_m]
+    msg.velocity = [velocity_mps]
+    msg.effort = [effort_n]
+    return msg
+
+
+def test_the_velocity_limit_comes_from_the_shipped_description():
+    """The ramp ceiling is the joint's own limit, read out of the description
+    instead of restated in Python. Fails if the description stops carrying a
+    literal there (a xacro expression, or the attribute going away), which is
+    the way this could silently start being re-derived from something else.
+    """
+    limit = finger_velocity_limit_mps(DESCRIPTION_PATH)
+
+    assert limit > 0.0
+    # Both fingers move together through one mechanism; a mimic joint carrying
+    # a different ceiling than the joint it mimics is a description bug.
+    velocities = {
+        joint.find("limit").get("velocity")
+        for joint in ElementTree.parse(DESCRIPTION_PATH).getroot().iter("joint")
+        if "ar_gripper_body_finger" in (joint.get("name") or "")
+    }
+    assert velocities == {str(limit)}
+
+
+def test_a_non_literal_velocity_limit_is_an_error_not_a_guess(tmp_path):
+    description = tmp_path / "macro.xacro"
+    description.write_text(
+        '<robot><joint name="p_ar_gripper_body_finger1" type="prismatic">'
+        '<limit effort="1000.0" lower="0.0" upper="0.05" '
+        'velocity="${FINGER_VELOCITY}"/></joint></robot>'
+    )
+
+    with pytest.raises(ValueError, match="non-literal velocity limit"):
+        finger_velocity_limit_mps(description)
+
+
+def test_the_ramp_never_outruns_the_description_velocity_limit():
+    """Publishing faster than the joint's limit just puts the target ahead of a
+    joint that cannot follow it. The driver asks for far more than the limit
+    (122500 steps/s is ~1.55 m/s against a limit of a few cm/s), so the clamp
+    is load-bearing on every real move, and deleting it leaves no test red
+    unless one asserts the published step directly.
+    """
+    limit = 0.02
+    bus, node = make_bus(max_velocity_mps=limit)
+    node.subscription_callback(sample(0.0))
+    bus.set_drive_parameter(_DRIVE_SPEED_ADDR, 2450)  # 122500 steps/s, ~1.55 m/s
+    bus.command(0.05)
+
+    node.timer_callback()
+    node.timer_callback()
+    node.timer_callback()
+
+    # The stub clock advances one tick period per call, and the ramp steps by
+    # rate x measured interval -- so the first tick, which has no previous one
+    # to measure against, moves nothing.
+    step = limit / IsaacJointBus.COMMAND_RATE_HZ
+    assert [msg.position[0] for msg in node.published.messages] == [
+        pytest.approx(0.0),
+        pytest.approx(step),
+        pytest.approx(2 * step),
+    ]
+
+
+def test_the_first_sample_seeds_the_goal_instead_of_commanding_a_full_close():
+    """0.0 m is the fully closed stop, not a neutral default. A bus that starts
+    out believing the goal is 0.0 slams the finger shut the moment the driver
+    starts, wherever it happens to be -- observed driving a finger from 0.019 m
+    to 0.000 m on a restart with no goal ever sent.
+    """
+    bus, node = make_bus()
+
+    # Before any sample there is no defensible target, so nothing is published.
+    node.timer_callback()
+    assert node.published.messages == []
+
+    node.subscription_callback(sample(0.019))
+    bus.set_drive_parameter(_DRIVE_SPEED_ADDR, 2450)
+    node.timer_callback()
+
+    assert node.published.messages[-1].position[0] == pytest.approx(0.019)
+
+
+def test_the_subscription_and_the_ramp_timer_get_their_own_callback_groups():
+    """Both must stay out of the node's default group and out of each other's.
+
+    A blocking read inside a callback in the node's default group (the status
+    timer does exactly that) would otherwise hold off the subscription that
+    delivers the sample it is blocked on, and the ramp timer and the
+    subscription fire at comparable rates, so serialising them against each
+    other recreates a smaller version of the same contention.
+    """
+    _bus, node = make_bus()
+
+    assert node.subscription_group is not None
+    assert node.timer_group is not None
+    assert node.subscription_group is not node.timer_group

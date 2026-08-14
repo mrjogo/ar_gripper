@@ -12,7 +12,9 @@ from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -75,6 +77,14 @@ class ARGripper:
         self._goal_lock = Lock()
         self._commanding_lock = Lock()
         self._goal_handle = None
+        # A grasp occupies its execute callback for as long as the move takes,
+        # up to Gripper._goto_position's whole timeout. In the node's default
+        # MutuallyExclusiveCallbackGroup that would also hold off the status,
+        # diagnostics and overload timers that share it, so joint_states and
+        # diagnostics would go silent for the duration of every grasp --
+        # exactly when a consumer most wants to see them. Its own group lets
+        # the action run concurrently with them.
+        self._action_callback_group = MutuallyExclusiveCallbackGroup()
         self._action_server = ActionServer(
             self._node,
             GripperCommand,
@@ -83,24 +93,38 @@ class ARGripper:
             handle_accepted_callback=self._handle_accepted_callback,
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
+            callback_group=self._action_callback_group,
         )
 
         if skip_calibration:
-            # DEBT, not a fix. Isaac's finger DOFs currently report a dead
-            # effort channel -- flat ~0.0003 N whether the finger is free or
-            # pinned against a hard stop, live-measured over a 28 s run and
-            # confirmed not a bridge-wide problem (arm DOFs in the same
-            # message carry real gravity torques) -- so _calibrate()'s
-            # present_load-based contact detection can never succeed against
-            # the live simulator and always exhausts its retries. Marking
-            # calibrated without running the real homing sequence unblocks
-            # bring-up and verification; it is not a substitute for a working
-            # contact source. Whoever adds one should delete this branch
-            # along with the isaac_skip_calibration parameter that gates it.
+            # DEBT, not a fix. Against Isaac, homing cannot use force at all:
+            # the finger's measured joint effort reports the joint's reaction
+            # to EXTERNAL loads, and a finger pressed against its own joint
+            # limit has no external load -- the drive force and the limit's
+            # reaction are internal to that joint and cancel exactly, so the
+            # near-zero reading is correct and the question is the wrong one.
+            # _calibrate()'s present_load-based contact detection therefore
+            # can never succeed there and always exhausts its retries. A hard
+            # stop is a constraint rather than a collision, so contact
+            # reporting cannot see it either; the mechanism that can is a
+            # velocity threshold plus a persistent position error, both
+            # already carried in the measured joint state.
+            #
+            # This branch flips the calibrated flag directly, which is NOT
+            # equivalent to homing: everything _calibrate() would establish on
+            # the way is left at whatever _init_servo left it at. Specifically
+            # unset are min_position_limit / max_position_limit (so nothing
+            # constrains a goal to the real stroke), position_correction and
+            # the encoder rezero (so present_position is an arbitrary offset
+            # from the real finger position rather than a homed one), and the
+            # calibration torque_limit. Whoever adds a working homing
+            # mechanism should delete this branch along with the
+            # isaac_skip_calibration parameter that gates it.
             self._node.get_logger().warning(
                 f"Gripper {gripper_name!r}: skipping startup calibration "
-                "(isaac_skip_calibration debt bypass) -- present_position is "
-                "NOT physically homed."
+                "(isaac_skip_calibration debt bypass) -- present_position is NOT "
+                "physically homed, and the position limits, position correction "
+                "and calibration torque limit homing would set are unset."
             )
             self.gripper._calibrated = True
         else:
@@ -253,8 +277,12 @@ class ARGripperNode(Node):
     STATUS_UPDATE_INTERVAL_S = 0.2
     SERVO_OVERLOAD_CHECK_INTERVAL_S = 0.05
 
-    def __init__(self):
-        super().__init__("ar_gripper")
+    def __init__(self, **node_kwargs):
+        # node_kwargs is forwarded straight to rclpy's Node so a caller can
+        # supply parameter_overrides. main() passes none; the tests that drive
+        # this constructor end to end use it to configure the backend without
+        # having to smuggle YAML through the global command line.
+        super().__init__("ar_gripper", **node_kwargs)
 
         for module in (
             "ar_gripper.gripper",
@@ -370,9 +398,17 @@ class ARGripperNode(Node):
             self._mock_bus, _ = install_ros_node_loopback()
 
         self._isaac_bus = None
+        self._isaac_node = None
+        self._isaac_executor = None
+        self._stamp_clock = None
         if isaac:
+            from ar_gripper import gripper as gripper_module
             from ar_gripper.mock import install_fake_serial
-            from ar_gripper.scripts.isaac_servo import IsaacJointBus, IsaacServo
+            from ar_gripper.scripts.isaac_servo import (
+                IsaacJointBus,
+                IsaacServo,
+                RosClock,
+            )
 
             isaac_joint_states_topic = self.declare_parameter(
                 "isaac_joint_states_topic",
@@ -398,12 +434,16 @@ class ARGripperNode(Node):
                 ParameterDescriptor(
                     description=(
                         "DEBT bring-up bypass, not a fix: mark the gripper "
-                        "calibrated without running the real homing sequence. "
-                        "Needed because Isaac's finger DOFs currently report a "
-                        "dead effort channel, so present_load-based contact "
-                        "detection can never succeed and real homing always "
-                        "fails. Delete this parameter once a working contact "
-                        "source lands."
+                        "calibrated without running the real homing sequence, "
+                        "leaving the position limits, position correction and "
+                        "torque limit that homing sets unset. Needed because a "
+                        "finger against its own joint limit exerts no external "
+                        "load, so the measured effort homing keys on is "
+                        "legitimately ~zero there and present_load-based "
+                        "contact detection can never succeed. Delete this "
+                        "parameter once homing gains a mechanism that works "
+                        "against a constraint (velocity threshold plus "
+                        "persistent position error)."
                     ),
                     read_only=True,
                 ),
@@ -418,37 +458,76 @@ class ARGripperNode(Node):
             # directly rather than install_ros_node_loopback(), and done
             # before the device opens (USB2FeetechDevice opens serial in
             # __init__). install_ros_node_loopback() would ALSO swap
-            # gripper.py's `time` for FakeTime, collapsing INRUSH_TIME and the
-            # stall-detection baseline window to nothing -- fine against the
-            # mock's instant in-memory model, wrong here: this backend runs
-            # against a real-time simulator, where those waits need to cost
-            # real wall-clock time to mean anything.
+            # gripper.py's `time` for FakeTime, which is an INSTANT clock:
+            # right for the mock's in-memory model, where the waits exist only
+            # to terminate, and wrong here, where the waiting is the point.
+            # The seam itself is the right one though, so it is reused just
+            # below with a clock that measures simulated time instead.
             self._isaac_bus, _ = install_fake_serial(None)
 
-            # Startup calibration below (inside the ARGripper() constructor)
-            # runs synchronously, still inside this Node's own __init__ --
-            # which returns to main() *before* its executor ever spins this
-            # node. Without help, IsaacJointBus's joint_states subscription
-            # and its command ramp timer would never run, and homing would
-            # starve waiting for a sample that never arrives (every read
-            # would silently time out and see the same frozen (0, 0, 0)
-            # sample forever). Spin this node on a private, temporary
-            # executor for the rest of construction; torn down again below
-            # before __init__ returns, so main()'s own executor is the only
-            # one ever spinning it once construction is done.
-            self._isaac_bootstrap_executor = rclpy.executors.SingleThreadedExecutor()
-            self._isaac_bootstrap_executor.add_node(self)
-            self._isaac_bootstrap_thread = Thread(
-                target=self._isaac_bootstrap_executor.spin, daemon=True
+            # Everything that talks to the simulator lives on its own node,
+            # spun by its own SingleThreadedExecutor, for two reasons.
+            #
+            # Sim time. Isaac runs at a real-time factor well below 1.0, so the
+            # driver's inrush window, stall baseline and move timeout, and the
+            # ramp timer that paces the commanded target, all mean something
+            # different measured on the wall clock than measured against the
+            # motion they describe. A ramp ticking on wall time in particular
+            # advances the target by the joint's full speed per WALL second
+            # while the joint only manages that per SIM second, so the target
+            # runs ahead of the joint -- the failure the ramp's own clamp
+            # exists to prevent. This node subscribes /clock and runs on it.
+            #
+            # Its own executor, because rclpy's MultiThreadedExecutor cannot
+            # carry a subscription at Isaac's rate. Measured in this workspace:
+            # one 120-500 Hz subscription on a MultiThreadedExecutor pins a
+            # core at ~0.98 and delivers a fraction of the messages, while the
+            # same load on a SingleThreadedExecutor costs ~0.5 of a core and
+            # delivers all of them; a MultiThreadedExecutor carrying only
+            # timers costs ~0.15. The executor loop spins on an entity that is
+            # ready but whose message has not been taken yet -- the take
+            # happens on a pool thread -- and that spin burns the GIL, which
+            # delays the very pool thread it is waiting for. The visible
+            # symptom is a subscription callback that runs tens of
+            # milliseconds after a message that arrived on time, which is what
+            # made blocking reads here time out. Keeping /clock and
+            # /isaac/joint_states, both 120 Hz, off the driver node's
+            # MultiThreadedExecutor is what avoids it.
+            #
+            # It also removes the need for a temporary bootstrap executor:
+            # startup calibration runs synchronously inside this constructor,
+            # before main() ever spins the driver node, and this executor is
+            # already running by then.
+            self._isaac_node = rclpy.create_node(
+                "ar_gripper_isaac_bus",
+                parameter_overrides=[
+                    Parameter("use_sim_time", Parameter.Type.BOOL, True)
+                ],
             )
-            self._isaac_bootstrap_thread.start()
+            self._isaac_executor = rclpy.executors.SingleThreadedExecutor()
+            self._isaac_executor.add_node(self._isaac_node)
+            self._isaac_spin_thread = Thread(
+                target=self._isaac_executor.spin, daemon=True
+            )
+            self._isaac_spin_thread.start()
+            # Same module-level `time` seam mock.install_ros_node_loopback()
+            # uses, with the simulator node's sim-time clock behind it.
+            # Installed before anything constructs a Gripper, since gripper.py
+            # reads the module attribute at call time.
+            gripper_module.time = RosClock(self._isaac_node)
+            # This node itself stays on wall time -- adding /clock to its
+            # MultiThreadedExecutor is the thing above says not to do -- so its
+            # periodic publishers tick in real time, which is what a
+            # diagnostics consumer wants anyway. Their message stamps still
+            # have to be on the simulator's timeline, or every consumer sees
+            # gripper joint states dated differently from the arm's.
+            self._stamp_clock = self._isaac_node.get_clock()
 
         try:
             # Inside the try (not above it): if this raises, the isaac
-            # bootstrap executor above has already started spinning this node
-            # on its own thread and must still be torn down in the finally
-            # below, or that thread is left spinning a node __init__ never
-            # finished building.
+            # executor above has already started spinning its node on its own
+            # thread and must still be torn down by the handler below, or that
+            # thread is left running after __init__ gave up.
             device = USB2FeetechDevice(port_name.value, baudrate=baudrate.value)
             for gripper_name, servo_ids in gripper_params.items():
                 if len(servo_ids) != 1:
@@ -476,7 +555,7 @@ class ARGripperNode(Node):
                     # places (with TurntableNode.JOINT_NAME and the xacro) that
                     # must change together.
                     joint_bus = IsaacJointBus(
-                        self,
+                        self._isaac_node,
                         joint_states_topic=isaac_joint_states_topic,
                         command_topic=isaac_command_topic,
                         joint_name="primary_ar_gripper_body_finger1",
@@ -496,28 +575,16 @@ class ARGripperNode(Node):
                 )
                 self.all_servos.append(gripper.gripper.servo)
                 self._grippers.append(gripper)
-        finally:
-            # Runs on the success path below and also on a calibration
-            # failure, which sys.exit()s out of the loop above: either way
-            # the bootstrap executor must stop spinning this node in its own
-            # thread before __init__ unwinds, or the daemon thread is still
-            # running when the interpreter starts finalizing on the way out
-            # of sys.exit() and crashes on shutdown.
+        except BaseException:
+            # BaseException, because a calibration failure leaves here as the
+            # SystemExit that sys.exit() raises. On any failed construction the
+            # simulator executor is already spinning its node on a daemon
+            # thread; leaving that running while the interpreter finalizes
+            # crashes on the way out. On the success path it keeps running for
+            # the life of the process and destroy_node() stops it.
             if isaac:
-                self._isaac_bootstrap_executor.remove_node(self)
-                self._isaac_bootstrap_executor.shutdown()
-                self._isaac_bootstrap_thread.join(timeout=2.0)
-                if self._isaac_bootstrap_thread.is_alive():
-                    # shutdown() didn't get the spin loop to exit in time --
-                    # it may still be spinning this node when main() adds it
-                    # to its own executor below. Loud rather than silent:
-                    # a second spinner on the same node is exactly the
-                    # double-callback hazard this whole bootstrap dance
-                    # exists to avoid.
-                    self.get_logger().error(
-                        "Isaac bootstrap executor thread did not stop within "
-                        "2s; it may still be spinning this node."
-                    )
+                self._shutdown_isaac_executor()
+            raise
 
         self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1
@@ -545,12 +612,38 @@ class ARGripperNode(Node):
             self.SERVO_OVERLOAD_CHECK_INTERVAL_S, self._check_servo_overload
         )
 
+    def _shutdown_isaac_executor(self):
+        """Stop the simulator node's private executor and its spin thread."""
+        if getattr(self, "_isaac_executor", None) is None:
+            return
+        self._isaac_executor.remove_node(self._isaac_node)
+        self._isaac_executor.shutdown()
+        self._isaac_spin_thread.join(timeout=2.0)
+        if self._isaac_spin_thread.is_alive():
+            self.get_logger().error(
+                "Isaac executor thread did not stop within 2s; it may still be "
+                "spinning its node."
+            )
+        self._isaac_node.destroy_node()
+        self._isaac_executor = None
+        self._isaac_node = None
+        self._stamp_clock = None
+
+    def destroy_node(self):
+        self._shutdown_isaac_executor()
+        return super().destroy_node()
+
+    def _stamp_now(self):
+        """Timestamp for outgoing messages, on the simulator's clock if there is one."""
+        clock = self._stamp_clock if self._stamp_clock is not None else self.get_clock()
+        return clock.now().to_msg()
+
     def _send_diagnostics(self):
         try:
             # See diagnostics with: rosrun rqt_runtime_monitor rqt_runtime_monitor
             msg = DiagnosticArray()
             msg.status = []
-            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.stamp = self._stamp_now()
 
             for gripper in (g.gripper for g in self._grippers):
                 for servo in [gripper.servo]:
@@ -586,7 +679,7 @@ class ARGripperNode(Node):
     def _send_status(self):
         try:
             state_msg = JointState()
-            state_msg.header.stamp = self.get_clock().now().to_msg()
+            state_msg.header.stamp = self._stamp_now()
             for gripper in self._grippers:
                 pos_percent = gripper.gripper.get_position()
                 joint_pos = ARGripperStandalone.percent_to_stroke(pos_percent)

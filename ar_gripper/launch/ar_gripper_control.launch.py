@@ -14,6 +14,7 @@ def launch_setup(context, *args, **kwargs):
     isaac = LaunchConfiguration("isaac")
     isaac_joint_states_topic = LaunchConfiguration("isaac_joint_states_topic")
     isaac_command_topic = LaunchConfiguration("isaac_command_topic")
+    isaac_skip_calibration = LaunchConfiguration("isaac_skip_calibration")
 
     ar_gripper_node = Node(
         package="ar_gripper",
@@ -30,6 +31,9 @@ def launch_setup(context, *args, **kwargs):
                 ),
                 "isaac_command_topic": ParameterValue(
                     isaac_command_topic, value_type=str
+                ),
+                "isaac_skip_calibration": ParameterValue(
+                    isaac_skip_calibration, value_type=bool
                 ),
             },
         ],
@@ -98,6 +102,19 @@ def generate_launch_description():
             "isaac_command_topic",
             default_value="/isaac/gripper/joint_commands",
             description="Isaac joint-command topic the servo backend publishes.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "isaac_skip_calibration",
+            default_value="false",
+            description=(
+                "Bring-up bypass for the isaac backend: mark the gripper calibrated "
+                "without running the real homing sequence, leaving the position "
+                "limits, position correction and torque limit homing sets unset. "
+                "Needed until homing gains a mechanism that works against a joint "
+                "limit, which exerts no external load for the effort channel to see."
+            ),
         )
     )
 

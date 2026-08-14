@@ -17,8 +17,12 @@ which is excluded from it, alongside ``ar_gripper.py``.
 """
 
 import threading
+from pathlib import Path
+from xml.etree import ElementTree
 
+from ament_index_python.packages import get_package_share_directory
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
 from sensor_msgs.msg import JointState
 
 from ar_gripper.mock import FakeServo
@@ -38,13 +42,101 @@ _TORQUE_LIMIT_ADDR = 0x30
 # those two addresses were pulled out here to avoid.
 _TICKS_PER_METRE = 78_900.0
 
+# The description this package owns and every consumer of the finger joint
+# shares -- Gazebo, MoveIt, the exported URDF Isaac's stage is built from, and
+# the ramp below. The joint is declared with a tf_prefix, so it is matched by
+# the unprefixed suffix.
+_DESCRIPTION_RELPATH = Path("urdf") / "ar_gripper_macro.xacro"
+_FINGER_JOINT_SUFFIX = "ar_gripper_body_finger1"
+
+
+def finger_velocity_limit_mps(description_path=None):
+    """Read the finger joint's ``<limit velocity="...">`` out of the description.
+
+    The ramp in ``IsaacJointBus`` must not publish targets faster than the
+    joint's own velocity limit, because that limit is also what Isaac clamps
+    the simulated joint to -- publish faster and the target simply runs ahead
+    of a joint that then catches up on its own schedule. That makes the limit a
+    number two subsystems have to agree on, and the description is the one that
+    already exists: copying it into a Python constant here would make this the
+    fourth place holding it (the two ``<limit>`` elements, the imported USD's
+    ``physxJoint:maxJointVelocity``, and a constant) and the first one to go
+    stale, since nothing would notice the disagreement.
+
+    The macro is read as plain XML rather than expanded through xacro: the
+    value is deliberately a literal there (see the comment above the joints),
+    expansion would pull in a build-time tool at node startup, and a literal
+    that stops being a literal should fail loudly here rather than be silently
+    re-derived. A non-numeric value therefore raises.
+    """
+    if description_path is None:
+        description_path = (
+            Path(get_package_share_directory("ar_gripper")) / _DESCRIPTION_RELPATH
+        )
+    root = ElementTree.parse(description_path).getroot()
+    for joint in root.iter("joint"):
+        name = joint.get("name") or ""
+        if not name.endswith(_FINGER_JOINT_SUFFIX):
+            continue
+        limit = joint.find("limit")
+        raw = limit.get("velocity") if limit is not None else None
+        if raw is None:
+            raise ValueError(
+                f"{description_path}: joint {name!r} has no <limit velocity=...>"
+            )
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{description_path}: joint {name!r} has a non-literal velocity "
+                f"limit {raw!r}. This file is read as plain XML; either keep the "
+                "limit a literal or teach this reader to expand xacro."
+            ) from exc
+    raise ValueError(
+        f"{description_path}: no joint named *{_FINGER_JOINT_SUFFIX} to take a "
+        "velocity limit from"
+    )
+
+
+class RosClock:
+    """``time.time()``/``time.sleep()`` over a ROS clock, for gripper.py's clock seam.
+
+    ``gripper.py`` measures its inrush window, stall baseline and move timeouts
+    with the ``time`` module, and ``mock.py`` already establishes the seam for
+    replacing it: assigning ``ar_gripper.gripper.time`` to any object exposing
+    ``time()`` and ``sleep()``. Against Isaac those durations have to be
+    measured in *simulated* seconds -- the simulator runs at a real-time factor
+    well below 1.0, so a 0.3 s inrush window measured on the wall clock covers
+    only ~0.2 s of the motion the driver is reasoning about, and a 20 s move
+    timeout expires part way through a move that has not actually taken 20
+    simulated seconds. Wrapping the node's own clock (which is sim time when
+    ``use_sim_time`` is set) makes every one of those durations mean what it
+    says.
+
+    This is the same seam ``mock.install_ros_node_loopback`` uses and the
+    opposite clock: that one installs ``FakeTime``, which advances instantly so
+    offline tests never wait. Here the waiting is the point.
+    """
+
+    def __init__(self, node):
+        self._clock = node.get_clock()
+
+    def time(self):
+        return self._clock.now().nanoseconds / 1e9
+
+    def sleep(self, seconds):
+        self._clock.sleep_for(Duration(nanoseconds=int(seconds * 1e9)))
+
 
 class IsaacJointBus:
     """Owns the joint-state subscription and joint-command publisher.
 
     Creates no node of its own; the caller (``scripts/ar_gripper.py``'s
-    ``isaac`` branch) passes the ``ARGripperNode`` itself, the same pattern
-    ``IsaacTurntable`` uses for the turntable.
+    ``isaac`` branch) passes one in, along with the executor that will spin it.
+    That caller gives it a node dedicated to simulator traffic rather than the
+    driver node -- see the comment where it is built for the measurement that
+    forced the split -- so this class must not assume it is sharing a node with
+    the driver's own timers, services or action.
 
     Only ``primary_ar_gripper_body_finger1`` is commanded. ``finger2`` is a
     dependent DOF held to it by a real solver constraint (a
@@ -60,21 +152,15 @@ class IsaacJointBus:
     """
 
     # Isaac's bridge publishes /isaac/joint_states at 120 Hz (barbot_stage.py);
-    # the ramp timer matches that so the commanded target advances on every
-    # tick the simulator can actually observe.
+    # the ramp timer asks for the same rate so the commanded target advances on
+    # every tick the simulator can actually observe. Nothing depends on the
+    # timer hitting it -- the ramp integrates the interval it measures.
     COMMAND_RATE_HZ = 120.0
-    # The finger joint's own <limit .../> velocity, m/s -- ar_gripper_macro.xacro's
-    # ar_gripper_body_finger1 prismatic joint (finger2's mimic copy carries the
-    # same number). This is the ramp's speed ceiling: drive_speed converts to an
-    # absurd ~1.55 m/s at the servo's real max (122500 steps/s), which would
-    # cross the whole 0.05 m stroke in 4 ticks (33 ms) -- inside
-    # Gripper._goto_position's 0.3 s INRUSH_TIME, so the baseline window and the
-    # stall window would collapse into the same window before ever publishing a
-    # single intermediate target. Isaac itself cannot track faster than this
-    # regardless of what gets published, so clamping here makes the published
-    # target follow what the joint can actually do instead of running ahead of
-    # it and sitting there while the joint catches up on its own schedule.
-    MAX_FINGER_VELOCITY_MPS = 0.0031
+    # Ceiling on the interval the ramp will integrate over in one tick, so a
+    # clock jump (a paused simulator, a stage reload resetting sim time) moves
+    # the target by at most a tenth of a second's travel instead of by
+    # however long the clock was away.
+    MAX_RAMP_INTERVAL_S = 0.1
     # Measured floor of the sim's real-time factor (mean 0.79, worst 0.68 --
     # see barbot_isaac stage notes). The wall-clock joint_states period is
     # 1 / (publish_hz * RTF); at the RTF floor that is ~12.25 ms. The wait cap
@@ -85,9 +171,29 @@ class IsaacJointBus:
     _RTF_FLOOR = 0.68
     DEFAULT_TIMEOUT_S = 5.0 / (COMMAND_RATE_HZ * _RTF_FLOOR)
 
-    def __init__(self, node, joint_states_topic, command_topic, joint_name):
+    def __init__(
+        self,
+        node,
+        joint_states_topic,
+        command_topic,
+        joint_name,
+        max_velocity_mps=None,
+    ):
         self._node = node
         self._joint_name = joint_name
+        # The ramp's speed ceiling, taken from the description rather than
+        # restated here (see finger_velocity_limit_mps). drive_speed is the
+        # *driver's* request and at the servo's real max converts to ~1.55 m/s,
+        # which would cross the whole 0.05 m stroke in four ticks (33 ms) --
+        # inside Gripper._goto_position's 0.3 s inrush window, so the baseline
+        # window and the stall window would collapse into the same window
+        # before a single intermediate target was ever published. The argument
+        # exists so tests can pin a limit without a description on disk.
+        self.max_velocity_mps = (
+            finger_velocity_limit_mps()
+            if max_velocity_mps is None
+            else max_velocity_mps
+        )
 
         # Guards every field below; wait_for_sample() blocks on it and
         # _on_joint_states()/command()/set_drive_parameter() notify/mutate
@@ -99,8 +205,17 @@ class IsaacJointBus:
         self._effort_n = 0.0
         self.timeout_count = 0
 
+        # Seeded from the first measured sample, not from zero: zero is a real
+        # position (the fully CLOSED stop), so a bus that starts out believing
+        # the goal is 0.0 commands a full close the instant the node comes up,
+        # wherever the finger actually is -- observed slamming a finger from
+        # 0.019 m to 0.000 m on a driver restart with no goal ever sent. Until
+        # the first sample arrives there is no defensible target to publish, so
+        # the ramp publishes nothing.
+        self._seeded = False
         self._goal_m = 0.0
         self._published_m = 0.0
+        self._last_tick_s = None
         # Steps/s from the last GOAL_SPEED (0x2E) write, converted to m/s.
         # Zero (the default) means "no drive_speed configured yet" -- until
         # the driver writes one, the ramp jumps straight to the goal, same as
@@ -111,21 +226,19 @@ class IsaacJointBus:
         # maxForce scale, not acted on.
         self.torque_limit_raw = None
 
-        # The node's other timers (status/diagnostics/overload-check in
-        # ar_gripper.py) sit in its default MutuallyExclusiveCallbackGroup,
-        # which admits one callback at a time even under a
-        # MultiThreadedExecutor. present_position/present_load reads block
-        # inside that group for up to DEFAULT_TIMEOUT_S waiting on a fresh
-        # sample -- and while blocked, nothing else in that SAME group can
-        # run, including the subscription callback that would deliver the
-        # sample being waited for, if it too were in that group. A private
-        # group for the subscription keeps it able to run while a
-        # status/diagnostics read elsewhere on the node blocks, instead of
-        # every such read being a guaranteed stall. The 120 Hz ramp timer
-        # gets its OWN separate group rather than sharing the subscription's:
-        # both fire at a comparable rate, and serialising them against each
-        # other would recreate a smaller version of the same contention this
-        # split exists to avoid.
+        # A private callback group each, so that nothing here can be starved
+        # by, or starve, a callback that blocks. What actually keeps this bus
+        # responsive is the executor it is given: ar_gripper.py puts the node
+        # it passes in on a SingleThreadedExecutor of its own, because rclpy's
+        # MultiThreadedExecutor cannot carry a subscription at Isaac's rate
+        # (measured: 53 of 120 Hz delivered for a whole core, with gaps up to
+        # 700 ms, against 118 Hz for 0.13 of a core with a worst gap of 9 ms).
+        # These groups are what keeps that placement from being the *only*
+        # thing standing between a blocking read and a stall: a read blocks
+        # for up to DEFAULT_TIMEOUT_S waiting on a fresh sample, and a
+        # MutuallyExclusiveCallbackGroup admits one callback at a time, so a
+        # subscription sharing a group with any blocking caller could only
+        # ever deliver the sample after that caller gave up.
         self._subscription_group = MutuallyExclusiveCallbackGroup()
         self._timer_group = MutuallyExclusiveCallbackGroup()
         self._command_pub = node.create_publisher(JointState, command_topic, 10)
@@ -154,6 +267,10 @@ class IsaacJointBus:
             self._position_m = position
             self._velocity_mps = velocity
             self._effort_n = effort
+            if not self._seeded:
+                self._goal_m = position
+                self._published_m = position
+                self._seeded = True
             self._seq += 1
             self._condition.notify_all()
 
@@ -215,25 +332,46 @@ class IsaacJointBus:
         # mock.FakeServo's travel_ticks_per_read, and it exists for the same
         # reason.
         #
-        # Clamped to MAX_FINGER_VELOCITY_MPS: drive_speed is the *driver's*
-        # request, and at the servo's real max it is far faster than the
-        # joint's own <limit .../> velocity Isaac will actually track (see
-        # that constant's docstring) -- publishing the unclamped rate just
-        # runs the target ahead of the joint and leaves it to catch up on
-        # its own schedule regardless.
+        # Clamped to the description's own velocity limit (max_velocity_mps):
+        # drive_speed is the *driver's* request, and at the servo's real max it
+        # is far faster than the joint's <limit .../> velocity Isaac will
+        # actually track -- publishing the unclamped rate just runs the target
+        # ahead of the joint and leaves it to catch up on its own schedule
+        # regardless.
         with self._condition:
+            if not self._seeded:
+                return
             goal = self._goal_m
-            rate = min(self._drive_speed_mps, self.MAX_FINGER_VELOCITY_MPS)
+            rate = min(self._drive_speed_mps, self.max_velocity_mps)
+        # The step is rate x MEASURED elapsed time, not rate / COMMAND_RATE_HZ.
+        # A fixed step per tick only travels at `rate` if the timer actually
+        # achieves COMMAND_RATE_HZ, and this one runs on the simulator's clock:
+        # a sim-time timer fires when the clock advances past its deadline, so
+        # its rate is the simulator's to decide, not ours. It has been measured
+        # at 95.7 Hz against a nominal 120, which as a fixed step is a silent
+        # 20% speed error. Integrating the measured interval instead makes the
+        # ramp travel at `rate` whatever the tick rate turns out to be:
+        # measured against a live stage after this change, the commanded target
+        # moves at 0.0310 m/s against a 0.031 m/s limit.
+        now = self._node.get_clock().now()
+        now_s = now.nanoseconds / 1e9
+        elapsed_s = now_s - self._last_tick_s if self._last_tick_s is not None else 0.0
+        self._last_tick_s = now_s
+        # Capped, because the clock can jump: sim time restarts at zero on a
+        # stage reload and stalls while the simulator is paused, and an
+        # uncapped interval would turn either into a single step that
+        # teleports the target across the whole stroke.
+        elapsed_s = min(max(elapsed_s, 0.0), self.MAX_RAMP_INTERVAL_S)
         if rate <= 0.0:
             self._published_m = goal
         else:
-            step = rate / self.COMMAND_RATE_HZ
+            step = rate * elapsed_s
             delta = goal - self._published_m
             self._published_m += (
                 delta if abs(delta) <= step else (step if delta > 0 else -step)
             )
         msg = JointState()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.stamp = now.to_msg()
         msg.name.append(self._joint_name)
         msg.position.append(self._published_m)
         self._command_pub.publish(msg)
