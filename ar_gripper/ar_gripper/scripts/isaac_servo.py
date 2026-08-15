@@ -365,8 +365,8 @@ class IsaacJointBus:
         )
 
         # Raw 0.1%/LSB register word from the last TORQUE_LIMIT (0x30) write.
-        # No Isaac analogue yet -- recorded for a future finger-drive
-        # maxForce scale, not acted on.
+        # Recorded, not acted on. See set_drive_parameter for why mapping it to
+        # the finger drive's maxForce would currently change nothing.
         self.torque_limit_raw = None
 
         # A private callback group each, so that nothing here can be starved
@@ -483,9 +483,22 @@ class IsaacJointBus:
     def set_drive_parameter(self, addr, value):
         """Record a drive_speed (0x2E) or torque_limit (0x30) write.
 
-        drive_speed paces the position ramp below. torque_limit has no Isaac
-        analogue yet -- recorded on ``torque_limit_raw`` for a future
-        finger-drive maxForce scale, not acted on.
+        drive_speed paces the position ramp below. torque_limit is recorded on
+        ``torque_limit_raw`` and not acted on.
+
+        Its faithful counterpart would be the finger drive's maxForce -- a
+        Feetech torque_limit is a ceiling on a position loop, and so is maxForce
+        -- but that mapping **cannot bind at present force levels, so it would
+        change nothing observable**. Gripper.HOLDING_TORQUE is 10% of
+        MAX_EFFORT_N, a 104 N ceiling, while the drive's maximum possible force
+        is its stiffness times the full stroke: 466.56 N/m x 0.05 m = 23 N. The
+        clip is 4.5x out of reach, so holding torque and the overload relax
+        stay invisible either way until grip force approaches ~100 N.
+
+        It is also not a small change when it does become worth doing: the only
+        driver-to-simulator channels are the three JointState command topics, so
+        it needs a new bridge subscriber plus drive-write code here and in
+        barbot_stage.py.
         """
         if addr == _DRIVE_SPEED_ADDR:
             # The wire encodes steps/s // 50 (FeetechSMSServo.drive_speed's
@@ -601,15 +614,19 @@ class IsaacServo(FakeServo):
     # to the stall limb every time. That is no longer true. The drive's
     # stability ceiling was re-measured and the stiffness went up 9x to
     # 466.56 N/m, which is exactly the condition this comment said to re-derive
-    # on, so: a grasp on the same 40 mm rigid box now reads 7.32 N on this joint
-    # (14.63 N summed across the two contacts), and the force limb is reachable
-    # for the first time.
+    # on, so: a grasp on the same 40 mm rigid box now reads 4.76 N on this joint
+    # (9.53 N summed across the two contacts), and the force limb is reachable
+    # for the first time. Those are the forces on the asset as it now ships; an
+    # earlier draft quoted 7.32 N / 14.63 N, which were measured on the fingers'
+    # previous convex-hull collider. That collider contacted 11 mm of travel
+    # early and so developed more force at more position error -- and gripped
+    # worse for it.
     #
     # Left at 2.0 N anyway, for now, because what it changes is still small: the
     # limbs are combined with max(), so a genuine stall still reports the larger
-    # stall_load, and 7.32 N is 0.70% of stall torque against homing's contact
+    # stall_load, and 4.76 N is 0.46% of stall torque against homing's contact
     # test at 10% and the overload test at 30%. Nothing acts differently at
-    # 0.70% than it did at 0.08%.
+    # 0.46% than it did at 0.08%.
     #
     # It is not a noise-rejection threshold -- the measured noise floor is
     # 3.3e-4 N, so this sits 6000x above it, a number inherited from a servo
