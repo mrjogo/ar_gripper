@@ -641,6 +641,11 @@ class IsaacServo(FakeServo):
     # which the stall detector is built on too, so nothing here and nothing
     # there can drift apart about what stopped means.
     MOVING_DEADBAND_MPS = MOVING_DEADBAND_MPS
+    # How far the joint has to have travelled between two samples to count as
+    # having moved at all. A tenth of a micrometre: eight times below the 0.8 um
+    # a joint at MOVING_DEADBAND_MPS covers in one 120 Hz sample, and far above
+    # the bit-identical readings a pinned joint gives. See _moving_now.
+    MOVED_EPSILON_M = 1.0e-7
 
     def __init__(self, bus):
         # mock.FakeServo's internal travel/obstruction model stays off: Isaac
@@ -650,12 +655,15 @@ class IsaacServo(FakeServo):
         self._bus = bus
         self._tick_offset = 0.0
         self._sample = None
+        self._previous_position = None
         self._stalled = False
 
     # -- the one seam: every live read pulls a fresh Isaac sample --------------------
     def _advance(self):
+        previous = self._sample
         self._sample = self._bus.wait_for_sample()
         self._stalled = self._bus.stalled
+        self._previous_position = previous[0] if previous is not None else None
         position_m, _velocity, _effort = self._sample
         self.present_position_value = round(
             self.CLOSED_POSITION_TICKS
@@ -700,9 +708,40 @@ class IsaacServo(FakeServo):
         return self._contact_load()
 
     def _moving_now(self):
+        """Moving means the velocity says so AND the joint has actually moved.
+
+        The second half is not belt and braces, it is the whole point. A joint
+        pinned against its own limit while a drive keeps commanding past it
+        reports the velocity the drive WANTS, not the velocity it has: measured
+        a constant -0.0293 m/s -- the finger's own velocity clamp, and 293x this
+        deadband -- held at a position of -0.00001 m for as long as the target
+        was re-applied, and dropping to exactly zero the frame the commands
+        stopped. PhysX's tensor API and the bridge's articulation-state node
+        agree on it, so it is the simulator's answer rather than a bridge
+        artefact.
+
+        Homing drives deliberately past the stop and its ramp republishes at a
+        fixed rate, so on velocity alone the finger never reads stopped, every
+        `Gripper._wait_for_stop` runs its full 20 s and calibration fails with
+        "home move timed out" from every start position. Position is the ground
+        truth: a pinned joint's is bit-identical frame to frame, while the
+        slowest motion this deadband admits still moves 0.8 um per 120 Hz
+        sample, eight times the epsilon below.
+
+        The caveat, so the next person does not have to find it: a repeated
+        sample (the bus returns the last one when it times out waiting for a
+        fresh one) also reads as not moving. `_wait_for_stop` needs three
+        consecutive samples to agree before it acts on that, which is what
+        keeps a single stale read from ending a move early.
+        """
         if self._sample is None:
             return 0
-        return 1 if abs(self._sample[1]) > self.MOVING_DEADBAND_MPS else 0
+        if abs(self._sample[1]) <= self.MOVING_DEADBAND_MPS:
+            return 0
+        if self._previous_position is None:
+            return 1
+        moved_m = abs(self._sample[0] - self._previous_position)
+        return 1 if moved_m > self.MOVED_EPSILON_M else 0
 
     def write(self, addr, data):
         if addr == self.GOAL_POSITION and len(data) >= 2:
