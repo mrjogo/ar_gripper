@@ -728,6 +728,17 @@ class IsaacServo(FakeServo):
         slowest motion this deadband admits still moves 0.8 um per 120 Hz
         sample, eight times the epsilon below.
 
+        This fixes ONE of the two consumers of the broken signal, and the other
+        is still blind: `Gripper._wait_for_stop` now returns instead of running
+        its full 20 s, but `StallDetector` decides "stopped" the same way and
+        still cannot see the finger arrive at its stop, so `present_load` never
+        rises and homing's first loop now fails as "homing failed" after three
+        attempts rather than timing out. The remaining fix is the same
+        correction applied where the stall detector asks the question, plus
+        something that keeps "not moving" from being true in the first samples
+        of a move, before the drive has responded -- this test alone reads as
+        stopped there, which is what makes those three attempts take a second.
+
         The caveat, so the next person does not have to find it: a repeated
         sample (the bus returns the last one when it times out waiting for a
         fresh one) also reads as not moving. `_wait_for_stop` needs three
