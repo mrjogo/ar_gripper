@@ -57,6 +57,13 @@ _TICKS_PER_METRE = 78_900.0
 # stale limit could put a finger at full speed two ticks from "not moving".)
 MOVING_DEADBAND_MPS = 1.0e-4
 
+# How far a joint has to travel between two PUBLISHED samples to count as having
+# moved. A tenth of a micrometre: eight times below the 0.8 um a joint at
+# MOVING_DEADBAND_MPS covers in one 120 Hz sample, and far above the bit-identical
+# readings a joint held against its limit gives. It exists because velocity cannot
+# answer the question -- see StallDetector.update.
+MOVED_EPSILON_M = 1.0e-7
+
 # How far from its target a *stopped* joint has to be before that gap counts as
 # something holding it back. Bounded from both sides, and neither bound needs
 # the simulated drive's gains restated here:
@@ -218,27 +225,77 @@ class StallDetector:
     driver's own state setup, free to drift away from the real one.
     """
 
-    def __init__(self, velocity_threshold_mps, position_error_m, dwell_s):
+    def __init__(
+        self,
+        velocity_threshold_mps,
+        position_error_m,
+        dwell_s,
+        moved_epsilon_m=MOVED_EPSILON_M,
+    ):
         self.velocity_threshold_mps = velocity_threshold_mps
         self.position_error_m = position_error_m
         self.dwell_s = dwell_s
+        self.moved_epsilon_m = moved_epsilon_m
         self._previous_target_m = None
+        self._previous_position_m = None
         self._previous_time_s = None
         self._since_s = None
         self.stalled = False
+        # Whether the joint moved between the last two published samples. The
+        # servo's moving_sign reads this, so the two questions the driver asks
+        # about motion -- "has it stopped?" and "is it moving?" -- are one
+        # measurement rather than two that can disagree.
+        self.moving = False
 
     def update(self, target_m, position_m, velocity_mps, now_s):
-        """Fold one sample in and return whether the joint is stalled."""
+        """Fold one sample in and return whether the joint is stalled.
+
+        ``velocity_mps`` is accepted and deliberately NOT used to decide whether
+        the joint has stopped. Isaac reports the velocity a drive *wants* rather
+        than the one the joint has: a finger pinned at its limit while a target
+        is re-applied every tick reads a constant -0.0293 m/s -- its own velocity
+        clamp, 293x velocity_threshold_mps -- at a position held bit-identical for
+        as long as the commands keep coming, dropping to exactly zero the frame
+        they stop. PhysX's tensor API and the bridge agree on it, so it is the
+        simulator's answer and not an artefact. Asking velocity therefore means
+        the detector never arms on the one case it exists for, which is precisely
+        a joint against a hard stop. Position is asked instead.
+
+        The trap that makes this delicate is the START of a move: the position
+        has not changed yet there either, so a naive position test reports an
+        instant stall on empty air. Two things prevent it, and the margin is
+        wide. The dwell is 0.18 s (0.6 of Gripper._wait_for_stop's 0.3 s window),
+        while at the shipped 0.031 m/s ramp against the finger drive's 0.21 s
+        time constant the joint covers this epsilon -- 0.1 um -- in about 1.2 ms,
+        and a whole 2.2 um within one 120 Hz sample. So a healthy move refutes
+        "stopped" roughly 150 dwells before the dwell could elapse. It also has
+        to survive only ONE sample, because the samples are the simulator's
+        published ones at ~120 Hz rather than the driver's register reads: two
+        reads in the same frame return the identical sample, which is what makes
+        comparing consecutive READS report a false stop immediately.
+        """
         error_m = target_m - position_m
         target_velocity_mps = 0.0
         if self._previous_target_m is not None and now_s > self._previous_time_s:
             target_velocity_mps = (target_m - self._previous_target_m) / (
                 now_s - self._previous_time_s
             )
+        moved_m = (
+            abs(position_m - self._previous_position_m)
+            if self._previous_position_m is not None
+            else None
+        )
         self._previous_target_m = target_m
+        self._previous_position_m = position_m
         self._previous_time_s = now_s
 
-        stopped = abs(velocity_mps) < self.velocity_threshold_mps
+        # The very first sample has no predecessor to compare against. It counts
+        # as stopped, which is what the velocity it replaced said about a joint
+        # at rest, and costs nothing: this happens once when the bus starts, not
+        # once per move, and a joint nothing is commanding anywhere cannot arm
+        # either limb.
+        stopped = moved_m is None or moved_m <= self.moved_epsilon_m
+        self.moving = moved_m is not None and moved_m > self.moved_epsilon_m
         pressing = abs(error_m) > self.position_error_m
         # Signs, not magnitudes: a target moving *toward* the joint is a move
         # arriving, not a joint being left behind, and only the away direction
@@ -475,6 +532,17 @@ class IsaacJointBus:
         with self._condition:
             return self._stall.stalled
 
+    @property
+    def moving(self):
+        """Whether the joint moved between the last two published samples.
+
+        The servo's moving_sign register. Comes from the stall detector so that
+        "stopped" means one thing in this backend; see StallDetector.update for
+        why it cannot be read off the simulator's velocity.
+        """
+        with self._condition:
+            return self._stall.moving
+
     def command(self, position_m):
         """Set the goal the ramp in ``_publish_ramped_target`` drives toward."""
         with self._condition:
@@ -641,12 +709,11 @@ class IsaacServo(FakeServo):
     # which the stall detector is built on too, so nothing here and nothing
     # there can drift apart about what stopped means.
     MOVING_DEADBAND_MPS = MOVING_DEADBAND_MPS
+
     # How far the joint has to have travelled between two samples to count as
     # having moved at all. A tenth of a micrometre: eight times below the 0.8 um
     # a joint at MOVING_DEADBAND_MPS covers in one 120 Hz sample, and far above
     # the bit-identical readings a pinned joint gives. See _moving_now.
-    MOVED_EPSILON_M = 1.0e-7
-
     def __init__(self, bus):
         # mock.FakeServo's internal travel/obstruction model stays off: Isaac
         # is the only source of motion here, and a second model competing
@@ -655,15 +722,12 @@ class IsaacServo(FakeServo):
         self._bus = bus
         self._tick_offset = 0.0
         self._sample = None
-        self._previous_position = None
         self._stalled = False
 
     # -- the one seam: every live read pulls a fresh Isaac sample --------------------
     def _advance(self):
-        previous = self._sample
         self._sample = self._bus.wait_for_sample()
         self._stalled = self._bus.stalled
-        self._previous_position = previous[0] if previous is not None else None
         position_m, _velocity, _effort = self._sample
         self.present_position_value = round(
             self.CLOSED_POSITION_TICKS
@@ -708,51 +772,18 @@ class IsaacServo(FakeServo):
         return self._contact_load()
 
     def _moving_now(self):
-        """Moving means the velocity says so AND the joint has actually moved.
+        """The servo's moving_sign register, from the bus's own measurement.
 
-        The second half is not belt and braces, it is the whole point. A joint
-        pinned against its own limit while a drive keeps commanding past it
-        reports the velocity the drive WANTS, not the velocity it has: measured
-        a constant -0.0293 m/s -- the finger's own velocity clamp, and 293x this
-        deadband -- held at a position of -0.00001 m for as long as the target
-        was re-applied, and dropping to exactly zero the frame the commands
-        stopped. PhysX's tensor API and the bridge's articulation-state node
-        agree on it, so it is the simulator's answer rather than a bridge
-        artefact.
-
-        Homing drives deliberately past the stop and its ramp republishes at a
-        fixed rate, so on velocity alone the finger never reads stopped, every
-        `Gripper._wait_for_stop` runs its full 20 s and calibration fails with
-        "home move timed out" from every start position. Position is the ground
-        truth: a pinned joint's is bit-identical frame to frame, while the
-        slowest motion this deadband admits still moves 0.8 um per 120 Hz
-        sample, eight times the epsilon below.
-
-        This fixes ONE of the two consumers of the broken signal, and the other
-        is still blind: `Gripper._wait_for_stop` now returns instead of running
-        its full 20 s, but `StallDetector` decides "stopped" the same way and
-        still cannot see the finger arrive at its stop, so `present_load` never
-        rises and homing's first loop now fails as "homing failed" after three
-        attempts rather than timing out. The remaining fix is the same
-        correction applied where the stall detector asks the question, plus
-        something that keeps "not moving" from being true in the first samples
-        of a move, before the drive has responded -- this test alone reads as
-        stopped there, which is what makes those three attempts take a second.
-
-        The caveat, so the next person does not have to find it: a repeated
-        sample (the bus returns the last one when it times out waiting for a
-        fresh one) also reads as not moving. `_wait_for_stop` needs three
-        consecutive samples to agree before it acts on that, which is what
-        keeps a single stale read from ending a move early.
+        Not from ``self._sample[1]``: Isaac reports the velocity a blocked drive
+        wants rather than the one the joint has, so a finger against its stop
+        reads as moving forever and no move ever completes. Not from comparing
+        one read against the previous one either -- the two reads a poll makes
+        land in the same simulator frame and return the identical sample, which
+        reads as "not moving" and ends a move before it has begun. The bus folds
+        each PUBLISHED sample into the stall detector as it arrives, and this is
+        that answer.
         """
-        if self._sample is None:
-            return 0
-        if abs(self._sample[1]) <= self.MOVING_DEADBAND_MPS:
-            return 0
-        if self._previous_position is None:
-            return 1
-        moved_m = abs(self._sample[0] - self._previous_position)
-        return 1 if moved_m > self.MOVED_EPSILON_M else 0
+        return 1 if self._bus.moving else 0
 
     def write(self, addr, data):
         if addr == self.GOAL_POSITION and len(data) >= 2:

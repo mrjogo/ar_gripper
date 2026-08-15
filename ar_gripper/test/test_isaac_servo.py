@@ -61,9 +61,13 @@ class _ScriptedIsaacJointBus:
     read the servo as many times as it likes.
     """
 
-    def __init__(self, samples, stalled=False):
+    def __init__(self, samples, stalled=False, moving=False):
         self._samples = list(samples)
         self.stalled = stalled
+        # moving_sign comes off the bus rather than off the sample's velocity;
+        # see StallDetector.update for why the simulator's velocity cannot
+        # answer it.
+        self.moving = moving
         self.wait_for_sample_calls = 0
         self.commands = []
         self.drive_params = []
@@ -281,6 +285,13 @@ class _HardStopIsaacBus:
     def stalled(self):
         return self._stall.stalled
 
+    @property
+    def moving(self):
+        # The real bus answers moving_sign from the same detector, for the
+        # reason given in StallDetector.update: the simulator's velocity cannot
+        # be asked whether a joint has stopped.
+        return self._stall.moving
+
     def command(self, position_m):
         self._goal_m = position_m
 
@@ -368,8 +379,14 @@ def test_a_finger_held_off_its_target_is_called_stalled_after_the_dwell():
     assert not detector.update(error, 0.0, 0.0, STALL_DWELL_S / 2)
     assert detector.update(error, 0.0, 0.0, STALL_DWELL_S)
     # And releases the moment the joint gets going again, so a move that was
-    # blocked and then freed does not keep reporting contact.
-    assert not detector.update(error, 0.0, MOVING_DEADBAND_MPS, STALL_DWELL_S + 0.01)
+    # blocked and then freed does not keep reporting contact. "Getting going" is
+    # the position changing: at MOVING_DEADBAND_MPS one 120 Hz sample carries the
+    # joint 0.8 um, eight times the epsilon. Velocity is deliberately left at the
+    # value a pinned joint reports, because that is exactly the case where it
+    # lies -- if this released on velocity alone it would release on a finger
+    # that never moved.
+    freed_m = MOVING_DEADBAND_MPS / 120.0
+    assert not detector.update(error, freed_m, 0.0, STALL_DWELL_S + 0.01)
 
 
 def test_a_joint_already_stopped_when_the_move_starts_needs_no_run_up():
