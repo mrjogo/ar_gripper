@@ -42,14 +42,7 @@ class ARGripper:
     duplicated.
     """
 
-    def __init__(
-        self,
-        device,
-        gripper_name,
-        servo_id,
-        servo_position_path,
-        node,
-    ):
+    def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
         self._node = node
         # Build the standalone WITHOUT calibrating yet, so the action/service
         # endpoints are advertised before the (potentially blocking) startup
