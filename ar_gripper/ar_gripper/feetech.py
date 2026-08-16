@@ -1,8 +1,11 @@
 import logging
 from threading import Lock
+from time import perf_counter
 
 import serial
 import serial.tools.list_ports
+
+from ar_gripper import tracing
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,16 @@ class FeetechServo:
         checksum = self._calc_checksum(msg)
         msg = [0xFF, 0xFF] + msg + [checksum]
 
+        # Motion tracing. Off, this is one module-attribute read compared
+        # against None -- no clock read, no buffer, nothing else on the path.
+        # On, it is two perf_counter() calls and a tuple append onto a list,
+        # inside the mutex this method already holds, with no formatting or
+        # I/O until the trace is written after the fact. That matters because
+        # what it measures is time: an instrument that cost anything material
+        # here would be reporting its own overhead. See ar_gripper/tracing.py.
+        trace = tracing._TRACE
+        issued = perf_counter() if trace is not None else 0.0
+
         with self.device.lock:
             failures = 0
             while True:
@@ -149,6 +162,17 @@ class FeetechServo:
                     logger.warning(
                         f"send_instruction retry {failures}, error: {e}"
                     )
+            if trace is not None:
+                trace.events.append(
+                    (
+                        issued,
+                        perf_counter(),
+                        self._servo_id,
+                        instruction[0],
+                        instruction[1],
+                        tuple(data),
+                    )
+                )
         if not exception_on_error_response:
             return data, err
         if err != 0:

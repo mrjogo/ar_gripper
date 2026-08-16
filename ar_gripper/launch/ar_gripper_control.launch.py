@@ -14,6 +14,8 @@ def launch_setup(context, *args, **kwargs):
     isaac = LaunchConfiguration("isaac")
     isaac_joint_states_topic = LaunchConfiguration("isaac_joint_states_topic")
     isaac_command_topic = LaunchConfiguration("isaac_command_topic")
+    bus_trace_path = LaunchConfiguration("bus_trace_path")
+    bus_trace_sample_hz = LaunchConfiguration("bus_trace_sample_hz")
 
     ar_gripper_node = Node(
         package="ar_gripper",
@@ -30,6 +32,10 @@ def launch_setup(context, *args, **kwargs):
                 ),
                 "isaac_command_topic": ParameterValue(
                     isaac_command_topic, value_type=str
+                ),
+                "bus_trace_path": ParameterValue(bus_trace_path, value_type=str),
+                "bus_trace_sample_hz": ParameterValue(
+                    bus_trace_sample_hz, value_type=float
                 ),
             },
         ],
@@ -98,6 +104,30 @@ def generate_launch_description():
             "isaac_command_topic",
             default_value="/isaac/gripper/joint_commands",
             description="Isaac joint-command topic the servo backend publishes.",
+        )
+    )
+
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "bus_trace_path",
+            default_value="",
+            description=(
+                "Write a timestamped trace of every Feetech bus transaction here "
+                "on shutdown, for motion profiling. Empty (default) disables it "
+                "and leaves the bus path untouched."
+            ),
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "bus_trace_sample_hz",
+            default_value="0.0",
+            description=(
+                "With bus_trace_path set, also read present_position at this rate. "
+                "0 (default) does not. This ADDS bus traffic and competes with the "
+                "control loop; prefer the passive trace unless you need the "
+                "resolution."
+            ),
         )
     )
 

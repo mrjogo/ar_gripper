@@ -25,6 +25,7 @@ from rclpy.qos import (
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Empty
 
+from ar_gripper import tracing
 from ar_gripper.feetech import USB2FeetechDevice
 from ar_gripper.gripper import CalibrationError
 from ar_gripper.helpers import ConnectPythonLoggingToROS
@@ -304,6 +305,36 @@ class ARGripperNode(Node):
             ),
         )
         gripper_params = json.loads(gripper_params_json.value)
+        bus_trace_path = self.declare_parameter(
+            "bus_trace_path",
+            "",
+            ParameterDescriptor(
+                description=(
+                    "Write a timestamped trace of every Feetech bus transaction "
+                    "here on shutdown. Empty disables tracing entirely, which is "
+                    "the default and costs nothing on the bus path. Use it to "
+                    "profile motion: /joint_states at 5 Hz is far too coarse to "
+                    "time a one-second stroke."
+                ),
+                read_only=True,
+            ),
+        ).value
+        bus_trace_sample_hz = self.declare_parameter(
+            "bus_trace_sample_hz",
+            0.0,
+            ParameterDescriptor(
+                description=(
+                    "With bus_trace_path set, additionally read present_position "
+                    "at this rate on a background thread. 0 (default) does not. "
+                    "This ADDS bus traffic rather than observing it -- each read "
+                    "occupies the bus for a round trip and competes with the "
+                    "control loop -- so raise resolution with it only when you "
+                    "need to, and compare against an unsampled run."
+                ),
+                read_only=True,
+            ),
+        ).value
+
         servo_position_path = self.declare_parameter(
             "servo_position_path",
             ARGripperStandalone.DEFAULT_SERVO_POSITION_PATH,
@@ -366,6 +397,19 @@ class ARGripperNode(Node):
                 "(no serial hardware)"
             )
             self._mock_bus, _ = install_ros_node_loopback()
+
+        # Enabled BEFORE the first servo is built, so the startup homing --
+        # the longest and least observable motion the driver makes -- is in the
+        # trace rather than missing from the front of it.
+        self._bus_trace = None
+        self._bus_trace_path = bus_trace_path
+        self._position_sampler = None
+        self._bus_trace_sample_hz = bus_trace_sample_hz
+        if bus_trace_path:
+            self._bus_trace = tracing.enable()
+            self.get_logger().warn(
+                f"Feetech bus tracing ON, writing to {bus_trace_path} on shutdown"
+            )
 
         self._isaac_bus = None
         self._isaac_node = None
@@ -545,6 +589,15 @@ class ARGripperNode(Node):
                 self._shutdown_isaac_executor()
             raise
 
+        if self._bus_trace is not None and self._bus_trace_sample_hz > 0.0:
+            self._position_sampler = tracing.PositionSampler(
+                self._grippers[0].gripper.servo, self._bus_trace_sample_hz
+            ).start()
+            self.get_logger().warn(
+                f"position sampler ON at {self._bus_trace_sample_hz:g} Hz; this "
+                "adds bus traffic and will slow the control loop"
+            )
+
         self._diagnostics_pub = self.create_publisher(
             DiagnosticArray, "/diagnostics", 1
         )
@@ -640,7 +693,27 @@ class ARGripperNode(Node):
         self._isaac_spin_thread = None
         self._stamp_clock = None
 
+    def _write_bus_trace(self):
+        """Stop tracing and write the CSV. Never raises: this is diagnostics."""
+        if self._position_sampler is not None:
+            self._position_sampler.stop()
+            self._position_sampler = None
+        if self._bus_trace is None:
+            return
+        trace, self._bus_trace = self._bus_trace, None
+        tracing.disable()
+        try:
+            tracing.write_csv(self._bus_trace_path, trace)
+            self.get_logger().info(
+                f"wrote {len(trace)} bus transactions to {self._bus_trace_path}"
+            )
+        except (OSError, ValueError) as exc:
+            # An unwritable path or an empty trace. Reported, never raised:
+            # losing diagnostics must not turn a clean shutdown into a crash.
+            self.get_logger().error(f"could not write bus trace: {exc}")
+
     def destroy_node(self):
+        self._write_bus_trace()
         self._shutdown_isaac_executor()
         return super().destroy_node()
 
