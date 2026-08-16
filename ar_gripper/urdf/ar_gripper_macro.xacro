@@ -21,6 +21,30 @@
     <!-- Finger velocity limit: PROVISIONAL, 0.031 m/s, and it MUST be confirmed by
          timing a full open/close on the real gripper.
 
+         HOW TO CONFIRM IT, now that there is tooling for it. Attempted on
+         2026-08-16 and not completed: the gripper's servo cable had failed, so
+         nothing on the bus answered. Left for a follow-up.
+
+             ros2 launch ar_gripper ar_gripper_control.launch.py \
+                 bus_trace_path:=/tmp/gripper.csv bus_trace_sample_hz:=100
+             # drive several strokes of different lengths, then Ctrl-C
+             ros2 run ar_gripper analyze_bus_trace.py /tmp/gripper.csv
+
+         A full 0.05 m stroke takes about 1.6 s if this number is right and
+         about 16 s if the pre-2026-08 value of 0.0031 was, so the two are not
+         subtle to tell apart. What settles it is the reported cruise velocity,
+         not the stroke time: a stroke time also contains both ramps, the
+         driver's 0.3 s inrush window and its wait-for-stop dwell.
+
+         Also worth capturing in the same run, since the rig is set up: the
+         servo's acceleration register (0x29, `FeetechSMSServo.acceleration`,
+         steps/s^2) read back and compared against the acceleration the trace
+         implies. Nothing has ever checked that the configured value is what
+         the mechanism does. Sample at 100 Hz for that, because the driver's
+         own reads are 10 Hz during a move, which is roughly one sample of
+         ramp. Take one unsampled run alongside it: sampling adds bus traffic,
+         and the point is to measure the move rather than the measurement.
+
          It is written as a literal on both <limit> elements below rather than as a
          xacro property because the Isaac servo backend reads this file as plain XML to
          avoid keeping a fourth copy of the number; a ${...} expression there would not
