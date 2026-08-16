@@ -8,7 +8,6 @@ reporting movement, so ``moving_sign`` reads follow the holding-torque write.
 """
 
 import pytest
-
 from ar_gripper.mock import checksum
 
 SID = 1

@@ -499,11 +499,20 @@ class ARGripperNode(Node):
                     # Replace the default in-memory register file with one backed
                     # by Isaac before the Gripper constructor probes the bus.
                     # FakeSerial.servo() uses setdefault, so pre-seeding here is
-                    # enough -- no change to mock.py is required. The joint name
-                    # is spelled out because tf_prefix is empty in this
-                    # deployment; if that ever changes, this is one of three
-                    # places (with TurntableNode.JOINT_NAME and the xacro) that
-                    # must change together.
+                    # enough -- no change to mock.py is required.
+                    #
+                    # The joint name is spelled out because tf_prefix is empty in
+                    # this deployment. If that ever changes, every site that
+                    # hardcodes the UNPREFIXED name has to change with it, and
+                    # they are spread across both repos: here, TurntableNode's
+                    # JOINT_NAME, and -- in the barbot repo -- the FINGER_JOINT
+                    # constants in barbot_isaac's barbot_stage.py and
+                    # import_robot_usd.py, plus the joint names in ar_gripper's
+                    # controller and joint-limit configs. Do not trust a count;
+                    # grep both trees for the bare name. The xacro is the source
+                    # they all have to agree with, and barbot_stage.py fails
+                    # loudly on a mismatch because it identifies the arm
+                    # articulation by its exact DOF set.
                     joint_bus = IsaacJointBus(
                         self._isaac_node,
                         joint_states_topic=isaac_joint_states_topic,

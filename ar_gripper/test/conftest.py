@@ -34,13 +34,20 @@ if str(_PKG_PARENT) not in sys.path:
 #
 # Overridden rather than defaulted, because the ambient domain is exactly the
 # hazard: inheriting a shell that happens to be pointed at a live stage is how
-# this happens. Kept clear of the domains this project drives by hand (42 for
-# the Isaac stage, 94 for the mock-motion launch test), which is the collision
-# that matters, since those are the ones with something actuated on the far
-# end. Spreading it over the pid makes two concurrent runs of this suite
-# unlikely to share a domain rather than guaranteed not to -- one in twenty --
-# and the cost of losing that coin toss is two test runs talking to each
-# other, not a robot moving.
+# this happens.
+#
+# 60-79 is chosen to clear every domain the sibling barbot repo actuates
+# something on. As of this writing that is: 42, the Isaac stage run by hand;
+# 81-88, barbot_moveit_tasks' launch tests (barbot_moveit_tasks/CMakeLists.txt);
+# and 91, the Isaac actuator-parity test (barbot_isaac/CMakeLists.txt). Those
+# are the collisions that matter, because each has something actuated on the
+# far end. Widening the spread below is therefore not free -- 60 + pid % 40
+# would reach into 81-88 and 91.
+#
+# Spreading it over the pid makes two concurrent runs of this suite unlikely to
+# share a domain rather than guaranteed not to -- one in twenty -- and the cost
+# of losing that coin toss is two test runs talking to each other, not a robot
+# moving.
 #
 # The environment is enough here, unlike this project's launch tests: rclpy
 # reads the domain when the context is initialised, which is inside the test
