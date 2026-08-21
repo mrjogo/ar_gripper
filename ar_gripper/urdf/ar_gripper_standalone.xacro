@@ -7,7 +7,7 @@
   <xacro:property name="tf_prefix" value="main_" />
 
   <material name="${tf_prefix}Red">
-    <color rgba="0.7 0.0 0.0 0.99"/>
+    <color rgba="0.7 0.0 0.0 1.0"/>
   </material>
 
   <link name="world"/>
