@@ -18,8 +18,13 @@
     <xacro:property name="FINGER_UPPER_LIMIT" value="0.05" />
     <xacro:property name="FINGER_BODY_GAP" value="0.0005" />
 
+    <!-- Alpha 1.0. An alpha below 1 is not a shading hint: it makes the
+         surface transmissive, and a renderer has to trace through it. Under
+         Isaac Sim that costs a ray one of a small budget of transmission
+         bounces, which a gripper nobody wants to see through was competing
+         for. -->
     <material name="${tf_prefix}Black">
-      <color rgba="0.1 0.1 0.1 0.99"/>
+      <color rgba="0.1 0.1 0.1 1.0"/>
     </material>
 
     <link name="${tf_prefix}ar_gripper_mount" />
