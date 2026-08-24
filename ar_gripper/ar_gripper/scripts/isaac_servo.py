@@ -57,12 +57,58 @@ _TICKS_PER_METRE = 78_900.0
 # stale limit could put a finger at full speed two ticks from "not moving".)
 MOVING_DEADBAND_MPS = 1.0e-4
 
-# How far a joint has to travel between two PUBLISHED samples to count as having
-# moved. A tenth of a micrometre: eight times below the 0.8 um a joint at
-# MOVING_DEADBAND_MPS covers in one 120 Hz sample, and far above the bit-identical
-# readings a joint held against its limit gives. It exists because velocity cannot
-# answer the question -- see StallDetector.update.
+# How far a joint has to travel to count as having moved at all. A tenth of a
+# micrometre: far below anything the published stream can express (see
+# SAMPLE_RESOLUTION_M) and far above the bit-identical readings a joint held
+# against its limit gives, so in practice this asks "did the reading change".
+# It exists because velocity cannot answer the question -- see
+# StallDetector.update.
 MOVED_EPSILON_M = 1.0e-7
+
+# The resolution of the joint positions Isaac publishes, MEASURED off a live
+# stage: every position on /isaac/joint_states is an exact multiple of 1e-4,
+# in metres for the prismatic finger and in radians for the arm. A stroke
+# traced through the driver reads
+#
+#     0.0027, 0.0025, 0.0024, 0.0024, 0.0023, 0.0022, 0.0021, 0.0020
+#
+# -- 0.1 mm steps, with repeats. The simulator is not moving the finger in
+# steps; the numbers arrive quantised. Nothing in this repository or in
+# barbot_isaac's graph rounds them, so this belongs to Isaac's own publish
+# path and is not ours to turn off; it is a property of the input, and the
+# rule below is sized against it rather than against the resolution the drive
+# actually has.
+SAMPLE_RESOLUTION_M = 1.0e-4
+
+# How long a joint's reading has to stay put before it counts as stopped.
+#
+# This window is what a two-sample comparison cannot do, and the difference is
+# the whole point. A finger settling into a reachable target approaches it
+# exponentially, so once it is closer than SAMPLE_RESOLUTION_M x the drive's
+# settling time constant / one sample period, it crosses a quantum boundary
+# LESS OFTEN than once per sample -- and consecutive samples start repeating
+# while it is still visibly moving. Comparing two of them then reports
+# "stopped" on a finger that is still 1.7 mm out, which is what the driver
+# reports as its final position and what makes GripperCommand come back with
+# reached_goal false. Measured, before this window existed: commanded 0.000 m,
+# finger at 0.0016 m when the move returned and 0.000 m three seconds later;
+# commanded 0.050 m, 0.0483 m at return and 0.050 m three seconds later. The
+# report was accurate; the move was not over.
+#
+# Sized from the quantum rather than picked. A joint this close to its target
+# moves at (distance / time constant), so it crosses one quantum every
+# (SAMPLE_RESOLUTION_M x time_constant / distance) seconds; requiring a quiet
+# window of W therefore calls it stopped once it is nearer than
+# SAMPLE_RESOLUTION_M x time_constant / W. At the 0.21 s the stage reports for
+# the finger drive, 0.1 s puts that at 0.21 mm -- comfortably inside the 1 mm
+# Gripper's own reached_goal test allows, with about 5x to spare, and it costs
+# roughly half a second at the end of a full stroke.
+#
+# Bounded above by homing, which is the tighter side: a stall has to be
+# reported inside WAIT_FOR_STOP_WINDOW_S, and against a hard stop the reading
+# is bit-identical from the moment the finger pins, so the stall now needs this
+# window plus STALL_DWELL_S. 0.1 + 0.18 = 0.28 s against a 0.3 s budget.
+MOVING_WINDOW_S = 0.1
 
 # How far from its target a *stopped* joint has to be before that gap counts as
 # something holding it back. Bounded from both sides, and neither bound needs
@@ -233,20 +279,29 @@ class StallDetector:
         position_error_m,
         dwell_s,
         moved_epsilon_m=MOVED_EPSILON_M,
+        moving_window_s=MOVING_WINDOW_S,
     ):
         self.velocity_threshold_mps = velocity_threshold_mps
         self.position_error_m = position_error_m
         self.dwell_s = dwell_s
         self.moved_epsilon_m = moved_epsilon_m
+        self.moving_window_s = moving_window_s
         self._previous_target_m = None
-        self._previous_position_m = None
         self._previous_time_s = None
         self._since_s = None
+        # The last reading that differed from the one before it, and when it
+        # arrived. Motion is measured against THIS rather than against the
+        # immediately preceding sample: the published stream is quantised (see
+        # SAMPLE_RESOLUTION_M), so consecutive samples repeat while the joint
+        # is still moving, and a joint is only stopped once its reading has
+        # stayed put for a whole moving_window_s.
+        self._last_change_m = None
+        self._last_change_s = None
         self.stalled = False
-        # Whether the joint moved between the last two published samples. The
-        # servo's moving_sign reads this, so the two questions the driver asks
-        # about motion -- "has it stopped?" and "is it moving?" -- are one
-        # measurement rather than two that can disagree.
+        # Whether the joint is still travelling. The servo's moving_sign reads
+        # this, so the two questions the driver asks about motion -- "has it
+        # stopped?" and "is it moving?" -- are one measurement rather than two
+        # that can disagree.
         self.moving = False
 
     def update(self, target_m, position_m, velocity_mps, now_s):
@@ -263,18 +318,27 @@ class StallDetector:
         the detector never arms on the one case it exists for, which is precisely
         a joint against a hard stop. Position is asked instead.
 
+        Motion is measured over a trailing window rather than between two
+        consecutive samples, and that is not a robustness flourish: the
+        published positions are quantised to SAMPLE_RESOLUTION_M, so a finger
+        settling into a reachable target starts repeating readings long before
+        it arrives, and any two-sample test calls it stopped there. See
+        MOVING_WINDOW_S for the measurement and the sizing.
+
         The trap that makes this delicate is the START of a move: the position
         has not changed yet there either, so a naive position test reports an
         instant stall on empty air. Two things prevent it, and the margin is
-        wide. The dwell is 0.18 s (0.6 of Gripper._wait_for_stop's 0.3 s window),
-        while at the shipped 0.031 m/s ramp against the finger drive's 0.21 s
-        time constant the joint covers this epsilon -- 0.1 um -- in about 1.2 ms,
-        and a whole 2.2 um within one 120 Hz sample. So a healthy move refutes
-        "stopped" roughly 150 dwells before the dwell could elapse. It also has
-        to survive only ONE sample, because the samples are the simulator's
-        published ones at ~120 Hz rather than the driver's register reads: two
-        reads in the same frame return the identical sample, which is what makes
-        comparing consecutive READS report a false stop immediately.
+        wide. The dwell is 0.18 s (0.6 of Gripper._wait_for_stop's 0.3 s
+        window), while at the shipped 0.031 m/s ramp the joint crosses its
+        first quantum -- 0.1 mm -- in about 3.2 ms, which refutes "stopped"
+        roughly 50 dwells before the dwell could elapse. The window itself is
+        not a second trap here for the same reason: it is reset by that first
+        crossing, not waited out.
+
+        Samples are the simulator's PUBLISHED ones at ~120 Hz rather than the
+        driver's register reads, which matters because two reads in the same
+        frame return the identical sample -- comparing consecutive READS would
+        report a false stop immediately, whatever the window did.
         """
         error_m = target_m - position_m
         target_velocity_mps = 0.0
@@ -282,22 +346,36 @@ class StallDetector:
             target_velocity_mps = (target_m - self._previous_target_m) / (
                 now_s - self._previous_time_s
             )
-        moved_m = (
-            abs(position_m - self._previous_position_m)
-            if self._previous_position_m is not None
-            else None
-        )
         self._previous_target_m = target_m
-        self._previous_position_m = position_m
         self._previous_time_s = now_s
 
-        # The very first sample has no predecessor to compare against. It counts
-        # as stopped, which is what the velocity it replaced said about a joint
-        # at rest, and costs nothing: this happens once when the bus starts, not
+        # Motion is "has the reading changed within the last moving_window_s",
+        # not "did it change since the previous sample". The published stream
+        # is quantised to SAMPLE_RESOLUTION_M, so a finger settling into its
+        # target crosses a quantum boundary less often than once per sample
+        # well before it arrives, and consecutive samples repeat while it is
+        # still moving. A clock that jumps backwards (sim time restarting on a
+        # stage reload) restarts the window rather than completing it.
+        #
+        # The very first sample has nothing to compare against. It counts as
+        # stopped, which is what the velocity it replaced said about a joint at
+        # rest, and costs nothing: this happens once when the bus starts, not
         # once per move, and a joint nothing is commanding anywhere cannot arm
         # either limb.
-        stopped = moved_m is None or moved_m <= self.moved_epsilon_m
-        self.moving = moved_m is not None and moved_m > self.moved_epsilon_m
+        if (
+            self._last_change_m is None
+            or self._last_change_s is None
+            or now_s < self._last_change_s
+        ):
+            self._last_change_m = position_m
+            self._last_change_s = now_s
+        elif abs(position_m - self._last_change_m) > self.moved_epsilon_m:
+            self._last_change_m = position_m
+            self._last_change_s = now_s
+            self.moving = True
+        elif now_s - self._last_change_s >= self.moving_window_s:
+            self.moving = False
+        stopped = not self.moving
         pressing = abs(error_m) > self.position_error_m
         # Signs, not magnitudes: a target moving *toward* the joint is a move
         # arriving, not a joint being left behind, and only the away direction

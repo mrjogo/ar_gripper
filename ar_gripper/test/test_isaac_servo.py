@@ -31,6 +31,8 @@ import pytest
 from ar_gripper.scripts.isaac_servo import (
     _DRIVE_SPEED_ADDR,
     MOVING_DEADBAND_MPS,
+    MOVING_WINDOW_S,
+    SAMPLE_RESOLUTION_M,
     STALL_DWELL_S,
     STALL_POSITION_ERROR_M,
     WAIT_FOR_STOP_WINDOW_S,
@@ -366,6 +368,119 @@ def test_a_finger_that_reaches_its_target_is_never_called_stalled():
         )
         error -= velocity * dt
     assert error < 1e-9  # the trace really did settle, rather than stopping short
+
+
+def _quantise(position_m):
+    """Round a position the way Isaac's publisher does before it reaches us."""
+    return round(position_m / SAMPLE_RESOLUTION_M) * SAMPLE_RESOLUTION_M
+
+
+def test_a_settling_finger_is_still_moving_once_its_samples_start_repeating():
+    """The regression: quantised samples repeat before the finger arrives.
+
+    Isaac publishes joint positions on a 1e-4 m grid, so a finger closing on
+    its target crosses a quantum boundary less often than once per sample well
+    before it gets there -- and a rule that asked "did the reading change since
+    the previous sample" answered "stopped" on a finger still 1.7 mm out. That
+    is what Gripper._goto_position returns on, so the move ended early, the
+    driver reported the position it really was at, and GripperCommand came back
+    with reached_goal false against its own 1 mm tolerance.
+
+    This walks the drive's first-order settle THROUGH the quantiser and asserts
+    the detector keeps calling it moving until it is inside a fifth of that
+    tolerance. Feeding un-quantised positions here would pass against either
+    rule, which is exactly why the bug survived the suite it already had.
+    """
+    detector = _detector()
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+    tau = 0.21  # the finger drive's time constant, as the stage reports it
+    target = 0.05
+    error = 0.0065  # the lag the ramp leaves behind at the end of a full stroke
+
+    started_moving = False
+    called_stopped_at = None
+    for step in range(int(5.0 / dt)):
+        position = _quantise(target - error)
+        detector.update(target, position, error / tau, step * dt)
+        # Only after it has been seen moving: `moving` starts False, and the
+        # first sample of any trace has nothing to compare against.
+        started_moving = started_moving or detector.moving
+        if started_moving and not detector.moving and called_stopped_at is None:
+            called_stopped_at = error
+        error -= (error / tau) * dt
+
+    assert started_moving, "the finger was never called moving in the first place"
+    assert called_stopped_at is not None, "the finger was never called stopped"
+    assert called_stopped_at < 2.0e-4, (
+        f"the finger was called stopped {called_stopped_at * 1e3:.2f} mm from "
+        "its target; Gripper.goto_position returns there and the driver's own "
+        "reached_goal test allows 1 mm"
+    )
+
+
+def test_a_repeated_sample_alone_does_not_mean_stopped():
+    """One repeat is the quantiser, not an arrival.
+
+    The narrowest statement of the bug: two identical readings in a row, a
+    third that has moved on. Under the old rule the middle sample reported
+    stopped -- and one sample is all Gripper._goto_position needs.
+    """
+    detector = _detector()
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+
+    detector.update(0.05, 0.0400, 0.01, 0.0)
+    detector.update(0.05, 0.0401, 0.01, dt)
+    detector.update(0.05, 0.0401, 0.01, 2 * dt)
+    assert detector.moving, "a single repeated reading was taken for an arrival"
+    detector.update(0.05, 0.0402, 0.01, 3 * dt)
+    assert detector.moving
+
+
+def test_a_joint_whose_reading_stays_put_is_stopped_after_the_window():
+    """And the other side of it: the window does elapse.
+
+    A finger that has genuinely arrived has to be reported as stopped, or no
+    move ever completes. MOVING_WINDOW_S is how long that takes.
+    """
+    detector = _detector()
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+
+    detector.update(0.05, 0.0499, 0.01, 0.0)
+    detector.update(0.05, 0.0500, 0.01, dt)
+    assert detector.moving
+
+    now = dt
+    while now < dt + MOVING_WINDOW_S:
+        now += dt
+        detector.update(0.05, 0.0500, 0.0, now)
+    assert (
+        not detector.moving
+    ), "a joint whose reading has not changed for a whole window is stopped"
+
+
+def test_the_first_quantum_crossing_refutes_stopped_at_the_start_of_a_move():
+    """The start-of-move trap, with the window in place.
+
+    A move begins with the joint not yet having moved, so it reads stopped --
+    and the outrun limb is armed from the first sample, so the dwell starts
+    counting immediately. What has to be true is that the joint refutes it long
+    before the dwell elapses. At the shipped ramp speed the first quantum
+    crossing lands ~3.2 ms in, against a dwell of 0.18 s.
+    """
+    detector = _detector()
+    dt = 1.0 / IsaacJointBus.COMMAND_RATE_HZ
+    speed = 0.031  # the description's finger velocity limit
+
+    position = 0.0
+    target = 0.0
+    for step in range(int(STALL_DWELL_S / dt)):
+        now = step * dt
+        target = speed * now
+        position = _quantise(speed * max(0.0, now - dt))
+        assert not detector.update(
+            target, position, speed, now
+        ), f"a move that had just started was called stalled at t={now:.4f} s"
+    assert detector.moving, "the joint never registered as moving"
 
 
 def test_a_finger_held_off_its_target_is_called_stalled_after_the_dwell():
