@@ -636,17 +636,30 @@ class IsaacJointBus:
 
         Its faithful counterpart would be the finger drive's maxForce -- a
         Feetech torque_limit is a ceiling on a position loop, and so is maxForce
-        -- but that mapping **cannot bind at present force levels, so it would
-        change nothing observable**. Gripper.HOLDING_TORQUE is 10% of
-        MAX_EFFORT_N, a 104 N ceiling, while the drive's maximum possible force
-        is its stiffness times the full stroke: 466.56 N/m x 0.05 m = 23 N. The
-        clip is 4.5x out of reach, so holding torque and the overload relax
-        stay invisible either way until grip force approaches ~100 N.
+        -- and that mapping has now been **measured not to bind**, rather than
+        argued not to. Sweeping the drive's authored maxForce against an
+        immovable body with barbot_isaac's scripts/measure_grip_force.py:
 
-        It is also not a small change when it does become worth doing: the only
-        driver-to-simulator channels are the three JointState command topics, so
-        it needs a new bridge subscriber plus drive-write code here and in
-        barbot_stage.py.
+            maxForce 1000 N (authored)   grip 3.547 N   finger at 18.566 mm
+            maxForce  104 N (HOLDING)    grip 3.547 N   finger at 18.566 mm
+            maxForce   10 N              grip 3.685 N   finger at 18.586 mm
+            maxForce    3 N              grip 2.056 N   finger at 18.661 mm
+            maxForce    1 N              grip 0.392 N   finger never left 50 mm
+
+        104 N is Gripper.HOLDING_TORQUE, 10% of MAX_EFFORT_N, and the LOWEST
+        ceiling the driver ever asks for. It is bit-identical to no ceiling at
+        all. The clip only starts biting below 10 N -- a thirtieth of the
+        smallest commanded value -- and by 1 N the finger cannot lift its own
+        weight, which is the 0.392 N floor in LOAD_DEADBAND_N above.
+
+        So acting on this register would be a channel that provably cannot
+        change an observable, and not a cheap one: the only driver-to-simulator
+        channels are the three JointState command topics, so it needs a new
+        bridge subscriber plus drive-write code here and in barbot_stage.py --
+        and barbot_stage.py deliberately wires positionCommand ONLY, because a
+        publisher that fills the effort array has it applied as a target that
+        argues with the position drive. Worth revisiting if grip force ever
+        approaches 100 N; nothing below that changes the answer.
         """
         if addr == _DRIVE_SPEED_ADDR:
             # The wire encodes steps/s // 50 (FeetechSMSServo.drive_speed's
@@ -755,36 +768,40 @@ class IsaacServo(FakeServo):
     # the finger toward 0.0 m instead of toward the open stop.
     CLOSED_POSITION_TICKS = 4095  # == Gripper._POSITION_MAX
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
-    # Below this the joint counts as unloaded. An earlier version of this
-    # comment recorded the force limb of _contact_load as UNREACHABLE, because
-    # the finger drive was 51.84 N/m and could not beat 1.30 N on this joint
-    # against the 2.0 N threshold; a grasp then read -0.835 N and fell through
-    # to the stall limb every time. That is no longer true. The drive's
-    # stability ceiling was re-measured and the stiffness went up 9x to
-    # 466.56 N/m, which is exactly the condition this comment said to re-derive
-    # on, so: a grasp on the same 40 mm rigid box now reads 4.76 N on this joint
-    # (9.53 N summed across the two contacts), and the force limb is reachable
-    # for the first time. Those are the forces on the asset as it now ships; an
-    # earlier draft quoted 7.32 N / 14.63 N, which were measured on the fingers'
-    # previous convex-hull collider. That collider contacted 11 mm of travel
-    # early and so developed more force at more position error -- and gripped
-    # worse for it.
+    # Below this the joint counts as unloaded.
     #
-    # Left at 2.0 N anyway, for now, because what it changes is still small: the
-    # limbs are combined with max(), so a genuine stall still reports the larger
-    # stall_load, and 4.76 N is 0.46% of stall torque against homing's contact
-    # test at 10% and the overload test at 30%. Nothing acts differently at
-    # 0.46% than it did at 0.08%.
+    # Derived from what this simulated finger actually reads, measured with
+    # barbot_isaac's scripts/measure_grip_force.py, because the value this
+    # replaces (2.0 N) came off a Feetech datasheet and had never been compared
+    # against either end of the decision it was making. What it has to separate
+    # is a grasp from no grasp, so it is bounded from both sides:
     #
-    # It is not a noise-rejection threshold -- the measured noise floor is
-    # 3.3e-4 N, so this sits 6000x above it, a number inherited from a servo
-    # whose stall torque really is on this scale. Now that grasp force reaches
-    # the driver, the honest derivation is from that noise floor and the grip
-    # forces actually reachable, not from the servo's datasheet; that is
-    # recorded in barbot_isaac/FUTURE_WORK.md rather than done here, because
-    # changing it changes what every grasp reports and wants its own
-    # measurement of what the consumers should see.
-    LOAD_DEADBAND_N = 2.0
+    #   FLOOR -- the finger's own weight. The measured joint effort carries a
+    #   steady bias of the finger mass projected onto its sliding axis: 0.3924 N
+    #   measured with empty jaws, against 0.040 kg x 9.81 = 0.392 N, which is an
+    #   exact match and therefore a real bound rather than one pose's accident.
+    #   Its SIGN moves with the arm pose, so any threshold has to clear its
+    #   magnitude. The sample-to-sample jitter is 2.2e-5 N -- four orders below
+    #   the bias, so the bias is the thing to clear, not the noise. (An earlier
+    #   note quoted a 3.3e-4 N "noise floor" and reasoned from that; that figure
+    #   is the jitter, and treating it as the floor is what left room for a
+    #   threshold three orders too high.)
+    #
+    #   CEILING -- the weakest grasp that has to register. Closing on a 40 mm
+    #   cube: 1.599 N per joint on a free 400 g body, 3.547 N on an immovable
+    #   one (so 3.2 N and 7.1 N summed across the two contacts).
+    #
+    # 2.0 N sat BETWEEN those, which is the bug: an ordinary grasp of a 400 g
+    # body developed 1.599 N and was reported as exactly zero load, while only
+    # pressing something immovable registered at all. 0.8 N sits 2.0x above the
+    # gravity bound and 2.0x below the weakest measured grasp.
+    #
+    # What this does NOT change is homing, which still runs on the stall limb:
+    # _contact_load reports a percentage of MAX_EFFORT_N, and 1.599 / 1041.25 is
+    # 0.15%, nowhere near the 10% homing's contact test wants. The difference is
+    # that a grasp now reports SOMETHING rather than nothing, which is what
+    # present_load and result.effort are for.
+    LOAD_DEADBAND_N = 0.8
     # Below this, moving_sign reads 0 (stopped) -- the module-scope constant,
     # which the stall detector is built on too, so nothing here and nothing
     # there can drift apart about what stopped means.

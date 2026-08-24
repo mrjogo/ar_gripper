@@ -586,6 +586,63 @@ def test_a_squeezed_object_still_reports_its_force(make_isaac_servo):
     assert gripper.servo.present_load == pytest.approx(50.0)
 
 
+# What the finger actually reads, measured on the shipped asset with
+# barbot_isaac's scripts/measure_grip_force.py under Isaac 6.0.1. These are the
+# two bounds LOAD_DEADBAND_N sits between, so they are written down here rather
+# than left in a commit message: a change to the drive, the collider or the
+# finger mass moves them, and this test is what says so.
+FINGER_WEIGHT_BIAS_N = 0.3924  # empty jaws; == 0.040 kg * 9.81
+GRASP_FREE_BODY_N = 1.599  # closing on a free 400 g, 40 mm cube
+GRASP_IMMOVABLE_N = 3.547  # closing on an immovable 40 mm cube
+
+
+def test_the_load_deadband_clears_the_finger_weight_but_not_a_grasp():
+    """The threshold has a job with two sides, and it used to fail one of them.
+
+    Below it sits the steady bias the finger's own weight puts on the measured
+    effort, whose sign moves with the arm pose -- anything under that reports
+    load on an empty gripper. Above it sits the weakest grasp that has to
+    register. At 2.0 N the threshold sat BETWEEN the bias and a real grasp, so
+    closing on a 400 g body reported exactly zero load.
+    """
+    assert IsaacServo.LOAD_DEADBAND_N > FINGER_WEIGHT_BIAS_N, (
+        "an empty gripper would report load: the finger's own weight alone "
+        f"reads {FINGER_WEIGHT_BIAS_N} N"
+    )
+    assert IsaacServo.LOAD_DEADBAND_N < GRASP_FREE_BODY_N, (
+        "a real grasp would report zero: the weakest measured one develops "
+        f"{GRASP_FREE_BODY_N} N"
+    )
+
+
+def test_a_grasp_of_a_free_body_reports_load_rather_than_zero(make_isaac_servo):
+    """The regression, at the level the driver sees it.
+
+    present_load is what homing reads and what a GripperCommand result carries
+    as `effort`. A 400 g body held in the jaws has to move it off zero.
+    """
+    gripper, _bus, _isaac = make_isaac_servo([(0.018, 0.0, GRASP_FREE_BODY_N)])
+    load = gripper.servo.present_load
+    assert load > 0.0, "a grasp of a free 400 g body still reports no load at all"
+    # Quantised on the way out through the servo's load register, so this checks
+    # the magnitude rather than the exact quotient: a fraction of one percent of
+    # stall torque, which is why homing still cannot run on it.
+    assert load < 1.0
+    assert load == pytest.approx(
+        GRASP_FREE_BODY_N / IsaacServo.MAX_EFFORT_N * 100.0, abs=0.2
+    )
+
+
+def test_an_empty_gripper_still_reports_exactly_zero_load(make_isaac_servo):
+    """And the other side: the finger's own weight is not a grasp.
+
+    Reported as exactly 0.0 rather than something small, because that is the
+    contract _contact_load documents and what the offline mock reports.
+    """
+    gripper, _bus, _isaac = make_isaac_servo([(0.05, 0.0, FINGER_WEIGHT_BIAS_N)])
+    assert gripper.servo.present_load == 0.0
+
+
 def test_drive_speed_conversion_undoes_the_wire_50x_encoding():
     """A live simulator run caught this: IsaacJointBus.set_drive_parameter
     must scale the raw DRIVE_SPEED register word back up by 50 before treating
