@@ -73,9 +73,10 @@ MOVED_EPSILON_M = 1.0e-7
 #     0.0027, 0.0025, 0.0024, 0.0024, 0.0023, 0.0022, 0.0021, 0.0020
 #
 # -- 0.1 mm steps, with repeats. The simulator is not moving the finger in
-# steps; the numbers arrive quantised. Nothing in this repository or in
-# barbot_isaac's graph rounds them, so this belongs to Isaac's own publish
-# path and is not ours to turn off; it is a property of the input, and the
+# steps; the numbers arrive quantised. Nothing in this repository rounds them,
+# and neither does the bridge graph that publishes them, so this belongs to
+# Isaac's own publish path and is not ours to turn off; it is a property of
+# the input, and the
 # rule below is sized against it rather than against the resolution the drive
 # actually has.
 SAMPLE_RESOLUTION_M = 1.0e-4
@@ -409,9 +410,8 @@ class IsaacJointBus:
 
     Only ``primary_ar_gripper_body_finger1`` is commanded. ``finger2`` is a
     dependent DOF held to it by a real solver constraint (a
-    ``PxArticulationMimicJoint``, confirmed in ``barbot_isaac``'s
-    ``import_robot_usd.py`` / ``barbot_stage.py`` to follow finger1 to within
-    1.0e-4 m with no drive of its own) -- giving it an independent target
+    ``PxArticulationMimicJoint``, confirmed against the composed robot asset
+    to follow finger1 to within 1.0e-4 m with no drive of its own) -- giving it an independent target
     would put a second actuator on the far side of that constraint, which the
     Isaac-side wiring deliberately avoids (``GripperController`` only
     receives finger1's command). It still shows up as its own DOF in
@@ -420,7 +420,8 @@ class IsaacJointBus:
     constructed with.
     """
 
-    # Isaac's bridge publishes /isaac/joint_states at 120 Hz (barbot_stage.py);
+    # Isaac's bridge publishes /isaac/joint_states at 120 Hz (the stage script
+    # ticks the bridge graph at the physics rate);
     # the ramp timer asks for the same rate so the commanded target advances on
     # every tick the simulator can actually observe. Nothing depends on the
     # timer hitting it -- the ramp integrates the interval it measures.
@@ -430,8 +431,9 @@ class IsaacJointBus:
     # the target by at most a tenth of a second's travel instead of by
     # however long the clock was away.
     MAX_RAMP_INTERVAL_S = 0.1
-    # Measured floor of the sim's real-time factor (mean 0.79, worst 0.68 --
-    # see barbot_isaac stage notes). The wall-clock joint_states period is
+    # Measured floor of the sim's real-time factor (mean 0.79, worst 0.68, on
+    # the stage this driver was developed against). The wall-clock
+    # joint_states period is
     # 1 / (publish_hz * RTF); at the RTF floor that is ~12.25 ms. The wait cap
     # must sit comfortably above that or every read silently returns a stale
     # sample -- set to 5x the worst-case period rather than a hardcoded
@@ -638,7 +640,8 @@ class IsaacJointBus:
         Feetech torque_limit is a ceiling on a position loop, and so is maxForce
         -- and that mapping has now been **measured not to bind**, rather than
         argued not to. Sweeping the drive's authored maxForce against an
-        immovable body with barbot_isaac's scripts/measure_grip_force.py:
+        immovable body, with the grip-force measurement tool that ships
+        alongside the simulator stage:
 
             maxForce 1000 N (authored)   grip 3.547 N   finger at 18.566 mm
             maxForce  104 N (HOLDING)    grip 3.547 N   finger at 18.566 mm
@@ -655,8 +658,8 @@ class IsaacJointBus:
         So acting on this register would be a channel that provably cannot
         change an observable, and not a cheap one: the only driver-to-simulator
         channels are the three JointState command topics, so it needs a new
-        bridge subscriber plus drive-write code here and in barbot_stage.py --
-        and barbot_stage.py deliberately wires positionCommand ONLY, because a
+        bridge subscriber plus drive-write code here and in the stage script --
+        and that script deliberately wires positionCommand ONLY, because a
         publisher that fills the effort array has it applied as a target that
         argues with the position drive. Worth revisiting if grip force ever
         approaches 100 N; nothing below that changes the answer.
@@ -770,8 +773,8 @@ class IsaacServo(FakeServo):
     MAX_EFFORT_N = 1041.25  # matches ARGripperStandalone.MAX_EFFORT (100% torque)
     # Below this the joint counts as unloaded.
     #
-    # Derived from what this simulated finger actually reads, measured with
-    # barbot_isaac's scripts/measure_grip_force.py, because the value this
+    # Derived from what this simulated finger actually reads, measured with the
+    # grip-force tool that ships alongside the simulator stage, because the value this
     # replaces (2.0 N) came off a Feetech datasheet and had never been compared
     # against either end of the decision it was making. What it has to separate
     # is a grasp from no grasp, so it is bounded from both sides:

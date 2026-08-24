@@ -44,7 +44,7 @@ from sensor_msgs.msg import JointState
 
 JOINT_NAME = "primary_ar_gripper_body_finger1"
 COMMAND_TOPIC = "/isaac/gripper/joint_commands"
-# Isaac's own publish rate for both topics (barbot_stage.py ticks the bridge
+# Isaac's own publish rate for both topics (the stage script ticks the bridge
 # graph at the physics rate), so the load here is the load in the field.
 SIM_PERIOD_S = 1.0 / 120.0
 # The finger's travel limits and the settling time constant of the drive that

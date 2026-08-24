@@ -36,13 +36,12 @@ if str(_PKG_PARENT) not in sys.path:
 # hazard: inheriting a shell that happens to be pointed at a live stage is how
 # this happens.
 #
-# 60-79 is chosen to clear every domain the sibling barbot repo actuates
-# something on. As of this writing that is: 42, the Isaac stage run by hand;
-# 81-88, barbot_moveit_tasks' launch tests (barbot_moveit_tasks/CMakeLists.txt);
-# and 91, the Isaac actuator-parity test (barbot_isaac/CMakeLists.txt). Those
-# are the collisions that matter, because each has something actuated on the
-# far end. Widening the spread below is therefore not free -- 60 + pid % 40
-# would reach into 81-88 and 91.
+# 60-79 is chosen to clear every domain the integrating robot workspace
+# actuates something on. As of this writing that is 42 (an Isaac stage run by
+# hand), 81-88 (that workspace's motion-planning launch tests) and 91 (its
+# Isaac actuator-parity test). Those are the collisions that matter, because
+# each has something actuated on the far end. Widening the spread below is
+# therefore not free -- 60 + pid % 40 would reach into 81-88 and 91.
 #
 # Spreading it over the pid makes two concurrent runs of this suite unlikely to
 # share a domain rather than guaranteed not to -- one in twenty -- and the cost

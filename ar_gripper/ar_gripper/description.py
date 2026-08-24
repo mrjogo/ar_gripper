@@ -9,7 +9,8 @@ the place that goes stale, because nothing compares the copies.
 Deliberately free of ROS imports, and free of anything outside the standard
 library. Two of the consumers cannot have ROS available: ``mock.py``'s
 ROS-free wheel is one, and the more demanding one is Isaac's own interpreter,
-where ``barbot_isaac``'s stage script loads this file directly by path (it must
+where the integrating repository's Isaac stage script loads this file directly
+by path (it must
 not source a ROS overlay -- see that script for why) so that its staleness
 check and the driver are reading the description through the same code rather
 than through two parsers that can drift apart. The one ROS-shaped thing here,

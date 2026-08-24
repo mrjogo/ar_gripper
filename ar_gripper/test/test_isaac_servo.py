@@ -586,8 +586,9 @@ def test_a_squeezed_object_still_reports_its_force(make_isaac_servo):
     assert gripper.servo.present_load == pytest.approx(50.0)
 
 
-# What the finger actually reads, measured on the shipped asset with
-# barbot_isaac's scripts/measure_grip_force.py under Isaac 6.0.1. These are the
+# What the finger actually reads, measured on the shipped asset with the
+# grip-force tool that ships alongside the simulator stage, under Isaac 6.0.1.
+# These are the
 # two bounds LOAD_DEADBAND_N sits between, so they are written down here rather
 # than left in a commit message: a change to the drive, the collider or the
 # finger mass moves them, and this test is what says so.
