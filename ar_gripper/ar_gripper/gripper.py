@@ -2,6 +2,7 @@ import logging
 import time
 from math import isclose
 from threading import Lock
+from time import monotonic as _real_monotonic
 
 from ar_gripper.feetech import FeetechSMSServo
 
@@ -10,6 +11,55 @@ logger = logging.getLogger(__name__)
 
 class CalibrationError(Exception):
     pass
+
+
+class Deadline:
+    """A wait bounded on the driver's clock, with a real-time backstop.
+
+    Every wait in this module is measured with the module-level ``time``, which
+    a caller may replace (``mock.py`` does, and so does the Isaac backend).
+    Against a simulator that clock is *simulated* time, which is the right unit
+    for reasoning about a move: the simulator can run at any real-time factor,
+    and a move's budget is a property of the motion, not of how fast the
+    machine happens to be simulating it.
+
+    It also means a simulator that STOPS makes the deadline unreachable. Sim
+    time never advances, the wait never expires, and the move hangs forever --
+    holding the action's lock, so every later goal hangs too and the driver
+    needs a restart. Pausing the simulator or reloading its stage is a routine
+    thing to do. So each wait also carries a real-time backstop at
+    ``WALL_BACKSTOP_FACTOR`` times its budget, which cannot be reached while
+    the simulator is merely slow: the worst real-time factor measured on this
+    stack is 0.68, and the backstop only trips below 1 / WALL_BACKSTOP_FACTOR.
+
+    ``expired()`` reports *which* deadline tripped, because "timed out" on its
+    own does not distinguish a move that failed from a simulator that stopped,
+    and those have nothing in common to investigate.
+    """
+
+    WALL_BACKSTOP_FACTOR = 3.0
+
+    def __init__(self, seconds):
+        self._seconds = seconds
+        self._wall_seconds = seconds * self.WALL_BACKSTOP_FACTOR
+        self._expiry = time.time() + seconds
+        self._wall_expiry = _real_monotonic() + self._wall_seconds
+
+    def elapsed(self):
+        """Seconds on the driver's clock since this deadline was created."""
+        return time.time() - (self._expiry - self._seconds)
+
+    def expired(self):
+        """None while both bounds hold, else a description of the one that tripped."""
+        if time.time() >= self._expiry:
+            return f"{self._seconds:g} s elapsed on the driver's clock"
+        if _real_monotonic() >= self._wall_expiry:
+            return (
+                f"wall-clock backstop: {self._wall_seconds:g} s of real time passed "
+                f"without {self._seconds:g} s passing on the driver's clock, so the "
+                "simulator is stopped, paused, or running far below real time"
+            )
+        return None
 
 
 class Gripper:
@@ -25,6 +75,15 @@ class Gripper:
     _CALIBRATION_TORQUE = 10
 
     _WAIT_CHECK_TIME_S = 0.1
+    # The inrush wait in _goto_position has nothing to read and nothing to do,
+    # so it yields between checks instead of spinning. A bare `continue` loop
+    # holds the GIL for whole scheduler quanta at a time, which on the ROS node
+    # starves every other Python thread in the process for the length of the
+    # window -- measured as the joint-state subscription callback not running
+    # within 61 ms of a message that had already arrived on time. Much shorter
+    # than _WAIT_CHECK_TIME_S because this one only has to bound the overshoot
+    # past INRUSH_TIME.
+    _INRUSH_POLL_TIME_S = 0.005
 
     def __init__(self, device, name, servo_id):
         self.name = name
@@ -220,7 +279,7 @@ class Gripper:
     def _wait_for_stop(self, servo, timeout=20.0, stop_delay=3):
         with self._aborted_lock:
             self._aborted = False
-        wait_start = time.time()
+        deadline = Deadline(timeout)
         last_position = 5000
         stop_count = 0
         while not self._is_aborted():
@@ -233,8 +292,9 @@ class Gripper:
                 stop_count = 0
             last_position = current_position
             time.sleep(self._WAIT_CHECK_TIME_S)
-            if time.time() - wait_start > timeout:
-                logger.warning("wait for stop timed out")
+            reason = deadline.expired()
+            if reason:
+                logger.warning(f"wait for stop timed out ({reason})")
                 return False
         # Stop movement if the move was aborted
         self.halt()
@@ -243,7 +303,7 @@ class Gripper:
     def _wait_for_no_load(self, servo, timeout=5.0):
         with self._aborted_lock:
             self._aborted = False
-        wait_start = time.time()
+        deadline = Deadline(timeout)
         last_load = 1000
         while not self._is_aborted():
             current_load = servo.present_load
@@ -251,8 +311,9 @@ class Gripper:
                 return True
             last_load = current_load
             time.sleep(self._WAIT_CHECK_TIME_S)
-            if time.time() - wait_start > timeout:
-                logger.warning("wait for no load timed out")
+            reason = deadline.expired()
+            if reason:
+                logger.warning(f"wait for no load timed out ({reason})")
                 return False
         return False
 
@@ -279,14 +340,16 @@ class Gripper:
         current_stall_count = 0
         # Start move
         self.servo.goal_position = position
-        move_start = time.time()
+        deadline = Deadline(TIMEOUT)
         while not self._is_aborted():
             # Check for timeout
-            if time.time() - move_start > TIMEOUT:
-                logger.error("goto position timed out")
+            reason = deadline.expired()
+            if reason:
+                logger.error(f"goto position timed out ({reason})")
                 break
             # Wait for initial current spike to subside
-            if time.time() - move_start < INRUSH_TIME:
+            if deadline.elapsed() < INRUSH_TIME:
+                time.sleep(self._INRUSH_POLL_TIME_S)
                 continue
             current = self.servo.present_current
             # Accumulate samples to average for baseline

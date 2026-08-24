@@ -7,8 +7,13 @@ pytest and puts the package source tree on ``sys.path``.
 The package under test lives at ``<repo>/ar_gripper/ar_gripper`` (an ament_cmake
 package, so there is no editable install); we prepend that directory to
 ``sys.path`` here so ``import ar_gripper.*`` resolves to the source tree.
+
+It also confines the suite's ROS traffic to a domain of its own, before any of
+it starts. See the comment on that below: some of these tests build a real
+driver, and a real driver COMMANDS THINGS.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +23,45 @@ import pytest
 _PKG_PARENT = Path(__file__).resolve().parents[1]
 if str(_PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PKG_PARENT))
+
+# Confine this suite to a ROS domain of its own, and to this machine.
+#
+# Not a tidiness measure. Several tests build a real ARGripperNode, and a real
+# driver publishes real joint commands: run this suite on the domain of a
+# running simulator and it physically drives that simulator's finger (observed:
+# 0.025 m -> 0.000 m), while its own reads get answered by the wrong publisher.
+# Point it at real hardware and it is a unit-test run commanding the robot.
+#
+# Overridden rather than defaulted, because the ambient domain is exactly the
+# hazard: inheriting a shell that happens to be pointed at a live stage is how
+# this happens.
+#
+# 60-79 is chosen to clear every domain the integrating robot workspace
+# actuates something on. As of this writing that is 42 (an Isaac stage run by
+# hand), 81-88 (that workspace's motion-planning launch tests) and 91 (its
+# Isaac actuator-parity test). Those are the collisions that matter, because
+# each has something actuated on the far end. Widening the spread below is
+# therefore not free -- 60 + pid % 40 would reach into 81-88 and 91.
+#
+# Spreading it over the pid makes two concurrent runs of this suite unlikely to
+# share a domain rather than guaranteed not to -- one in twenty -- and the cost
+# of losing that coin toss is two test runs talking to each other, not a robot
+# moving.
+#
+# The environment is enough here, unlike this project's launch tests: rclpy
+# reads the domain when the context is initialised, which is inside the test
+# process and always after this module is imported. A launch test has to set it
+# through ctest's ENVIRONMENT property because there the DDS layer comes up in
+# a process pytest does not own.
+#
+# LOCALHOST discovery on top, because the domain only separates us from other
+# processes; this box shares a network with a real turntable controller that
+# has hijacked tests before. It publishes /joint_states rather than /clock or
+# /isaac/joint_states, so it happens not to reach these tests today -- which is
+# the kind of accident that stops being true silently.
+_TEST_DOMAIN_ID = 60 + os.getpid() % 20
+os.environ["ROS_DOMAIN_ID"] = str(_TEST_DOMAIN_ID)
+os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
 
 # The launch_testing file is not a plain pytest module; keep pytest from importing it.
 collect_ignore_glob = ["*.launch.py"]

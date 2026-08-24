@@ -31,6 +31,7 @@ only-include = [
     "ar_gripper/feetech.py",
     "ar_gripper/gripper.py",
     "ar_gripper/standalone.py",
+    "ar_gripper/tracing.py",
     "ar_gripper/helpers.py",
     "ar_gripper/mock.py",
 ]

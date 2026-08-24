@@ -18,6 +18,54 @@
     <xacro:property name="FINGER_UPPER_LIMIT" value="0.05" />
     <xacro:property name="FINGER_BODY_GAP" value="0.0005" />
 
+    <!-- Finger velocity limit: PROVISIONAL, 0.031 m/s, and it MUST be confirmed by
+         timing a full open/close on the real gripper.
+
+         HOW TO CONFIRM IT, now that there is tooling for it. Attempted on
+         2026-08-16 and not completed: the gripper's servo cable had failed, so
+         nothing on the bus answered. Left for a follow-up.
+
+             ros2 launch ar_gripper ar_gripper_control.launch.py \
+                 bus_trace_path:=/tmp/gripper.csv bus_trace_sample_hz:=100
+             # drive several strokes of different lengths, then Ctrl-C
+             ros2 run ar_gripper analyze_bus_trace.py /tmp/gripper.csv
+
+         A full 0.05 m stroke takes about 1.6 s if this number is right and
+         about 16 s if the pre-2026-08 value of 0.0031 was, so the two are not
+         subtle to tell apart. What settles it is the reported cruise velocity,
+         not the stroke time: a stroke time also contains both ramps, the
+         driver's 0.3 s inrush window and its wait-for-stop dwell.
+
+         Also worth capturing in the same run, since the rig is set up: the
+         servo's acceleration register (0x29, `FeetechSMSServo.acceleration`,
+         steps/s^2) read back and compared against the acceleration the trace
+         implies. Nothing has ever checked that the configured value is what
+         the mechanism does. Sample at 100 Hz for that, because the driver's
+         own reads are 10 Hz during a move, which is roughly one sample of
+         ramp. Take one unsampled run alongside it: sampling adds bus traffic,
+         and the point is to measure the move rather than the measurement.
+
+         It is written as a literal on both <limit> elements below rather than as a
+         xacro property because the Isaac servo backend reads this file as plain XML to
+         avoid keeping a fourth copy of the number; a ${...} expression there would not
+         parse. If this ever has to become a property, teach that reader to expand
+         xacro instead of just moving the value.
+
+         Where 0.031 comes from. The finger's 0.05 m stroke spans 3945 encoder ticks on
+         a 4096 tick/rev encoder, i.e. 51.9 mm of finger travel per motor revolution.
+         The driver commands the servo at 122500 steps/s (Gripper._init_servo); the
+         value that actually goes on the wire is 122500 // 50 = 2450 steps/s, which at
+         78900 ticks/m is 0.031 m/s = 36 rpm. An STS3215 free-runs around 45 rpm, so
+         36 rpm loaded is mechanically sane.
+
+         The previous value here was 0.0031 m/s, i.e. 3.6 rpm, exactly 10x smaller.
+         Nothing derives it: `git log -S0.0031` finds no commit that introduced it, it
+         predates the directory move, and every timeout in gripper.py (the 20 s move
+         timeout, the 20 s wait-for-stop, the 0.3 s inrush window) is sized for a move
+         of order one second, not the 16 s a full stroke takes at 3.6 rpm. A dropped
+         decimal explains both numbers. Under Isaac the old value was binding and hard:
+         a full 0.05 m stroke could not complete inside the driver's own timeout. -->
+
     <!-- Alpha 1.0. An alpha below 1 is not a shading hint: it makes the
          surface transmissive, and a renderer has to trace through it. Under
          Isaac Sim that costs a ray one of a small budget of transmission
@@ -79,7 +127,7 @@
       </inertial>
     </link>
     <joint name="${tf_prefix}ar_gripper_body_finger1" type="prismatic">
-      <limit effort="1000.0" lower="${FINGER_LOWER_LIMIT}" upper="${FINGER_UPPER_LIMIT}" velocity="0.0031"/>
+      <limit effort="1000.0" lower="${FINGER_LOWER_LIMIT}" upper="${FINGER_UPPER_LIMIT}" velocity="0.031"/>
       <parent link="${tf_prefix}ar_gripper_body"/>
       <child link="${tf_prefix}ar_gripper_finger1"/>
       <axis xyz="-1 0 0"/>
@@ -109,7 +157,7 @@
       </inertial>
     </link>
     <joint name="${tf_prefix}ar_gripper_body_finger2" type="prismatic">
-      <limit effort="1000.0" lower="${FINGER_LOWER_LIMIT}" upper="${FINGER_UPPER_LIMIT}" velocity="0.0031"/>
+      <limit effort="1000.0" lower="${FINGER_LOWER_LIMIT}" upper="${FINGER_UPPER_LIMIT}" velocity="0.031"/>
       <parent link="${tf_prefix}ar_gripper_body"/>
       <child link="${tf_prefix}ar_gripper_finger2"/>
       <axis xyz="-1 0 0"/>

@@ -63,14 +63,31 @@ class FakeServo:
     (``data[0] | data[1] << 8``). A handful of "live" registers are computed so
     the state machines in ``gripper.py`` (calibrate / goto) actually converge:
 
-    * ``present_position`` (0x38) mirrors the last commanded ``goal_position``
+    * ``present_position`` (0x38) tracks the last commanded ``goal_position``
       (0x2A); a ``reset_current_position`` write (0x28 == 128) snaps it to 2048.
-      This models the servo instantly reaching its target so ``_wait_for_stop``
-      settles deterministically.
+      By default (``travel_ticks_per_read=0``) it reaches the goal instantly on
+      write, matching today's behaviour; with ``travel_ticks_per_read`` set, it
+      instead steps toward the goal by that many ticks per live-register read,
+      and can be clamped short of the goal by ``obstruction_ticks``.
     * ``present_load`` (0x3C) yields ``load_sequence`` values in order (repeating
-      the last once exhausted) so calibration's load-based loops terminate.
-    * ``present_current`` (0x45) yields ``current_value`` (constant by default).
-    * ``moving_sign`` (0x42) yields ``moving`` (0 == stopped by default).
+      the last once exhausted) by default. When ``obstruction_ticks`` is set,
+      load instead comes from contact: ``stall_load`` while the finger is against
+      the obstruction, exactly ``0.0`` otherwise, and ``load_sequence`` is not
+      consumed.
+    * ``present_current`` (0x45) yields ``current_value`` if it has been set to an
+      explicit override, otherwise ``no_load_current_ma + current_per_load_ma *
+      load`` (load from the obstruction model, never from ``load_sequence``),
+      quantised to the register's 6.5 mA/LSB resolution. ``current_value`` is
+      ``None`` by default.
+    * ``moving_sign`` (0x42) yields ``moving`` (0 == stopped by default) unless
+      travelling: then it reports 1 while short of the target, and continues to
+      report 1 for ``stall_moving_reads`` further reads after contact -- modeling
+      a servo that keeps reporting movement while it drives into a stop it cannot
+      pass -- before falling back to ``moving``.
+
+    ``FakeServo()`` with no arguments is unchanged from before this model
+    existed: it reaches its goal instantly, reports no load, and reports a
+    constant no-load current.
     """
 
     GOAL_POSITION = 0x2A
@@ -81,16 +98,87 @@ class FakeServo:
     MOVING_SIGN = 0x42
     RESET_MIDPOINT = 128
 
-    def __init__(self):
+    CURRENT_LSB_MA = 6.5
+    NO_LOAD_CURRENT_MA = 65.0
+    CURRENT_PER_LOAD_MA = 13.0
+    STALL_LOAD = 30.0
+
+    def __init__(
+        self,
+        travel_ticks_per_read=0,
+        obstruction_ticks=None,
+        stall_load=STALL_LOAD,
+        stall_moving_reads=6,
+    ):
         self.reg = bytearray(0x60)  # addresses 0x00..0x5F
         self.present_position_value = 150  # decoded ticks
         self.load_sequence = [0.0]
         self._load_idx = 0
-        self.current_value = 0.0
+        self.current_value = None
+        self.no_load_current_ma = self.NO_LOAD_CURRENT_MA
+        self.current_per_load_ma = self.CURRENT_PER_LOAD_MA
+        self.travel_ticks_per_read = travel_ticks_per_read
+        self.obstruction_ticks = obstruction_ticks
+        self.stall_load = stall_load
+        self.stall_moving_reads = stall_moving_reads
+        self._goal_value = self.present_position_value
+        self._stall_moving_left = stall_moving_reads
         self.moving = 0
         self.temperature = 25
         self.voltage_raw = 120  # -> present_voltage 12.0V (read off 0x3A)
         self._apply_init_defaults()
+
+    @property
+    def travelling(self):
+        return self.travel_ticks_per_read > 0
+
+    def _target(self):
+        if self.obstruction_ticks is None:
+            return self._goal_value
+        return min(self._goal_value, self.obstruction_ticks)
+
+    def _blocked(self):
+        return (
+            self.obstruction_ticks is not None
+            and self._goal_value > self.obstruction_ticks
+            and self.present_position_value == self.obstruction_ticks
+        )
+
+    def _advance(self):
+        if not self.travelling:
+            return
+        target = self._target()
+        delta = target - self.present_position_value
+        if delta == 0:
+            return
+        step = min(abs(delta), self.travel_ticks_per_read)
+        self.present_position_value += step if delta > 0 else -step
+
+    def _contact_load(self):
+        """Load from the obstruction model; never consumes ``load_sequence``."""
+        if self.obstruction_ticks is None:
+            return 0.0
+        return self.stall_load if self._blocked() else 0.0
+
+    def _load_now(self):
+        if self.obstruction_ticks is None:
+            return self._next_load()
+        return self._contact_load()
+
+    def _current_ma(self):
+        if self.current_value is not None:
+            return self.current_value
+        return self.no_load_current_ma + self.current_per_load_ma * self._contact_load()
+
+    def _moving_now(self):
+        if not self.travelling:
+            return self.moving
+        if self.present_position_value != self._target():
+            return 1
+        if self._blocked() and self._stall_moving_left > 0:
+            self._stall_moving_left -= 1
+            return 1
+        return self.moving
 
     def _apply_init_defaults(self):
         # Values chosen so Gripper._init_servo's _set_if_different comparisons all
@@ -114,15 +202,19 @@ class FakeServo:
 
     def read(self, addr, n):
         if addr == self.PRESENT_POSITION:
+            self._advance()
             return self._encode_position(self.present_position_value)[:n]
         if addr == self.PRESENT_LOAD:
-            raw = int(round(self._next_load() * 10))
+            self._advance()
+            raw = int(round(self._load_now() * 10))
             return bytes([raw & 0xFF, (raw >> 8) & 0xFF])[:n]
         if addr == self.PRESENT_CURRENT:
-            raw = int(round(self.current_value / 6.5))
+            self._advance()
+            raw = int(round(self._current_ma() / self.CURRENT_LSB_MA))
             return bytes([raw & 0xFF, (raw >> 8) & 0xFF])[:n]
         if addr == self.MOVING_SIGN:
-            return bytes([self.moving & 0xFF])[:n]
+            self._advance()
+            return bytes([self._moving_now() & 0xFF])[:n]
         return bytes(self.reg[addr : addr + n])
 
     def write(self, addr, data):
@@ -133,12 +225,17 @@ class FakeServo:
         ):
             # Overloaded: writing 128 resets the current position to 2048.
             self.present_position_value = 2048
+            self._goal_value = 2048
             return
         self.reg[addr : addr + len(data)] = bytes(data)
         if addr == self.GOAL_POSITION and len(data) >= 2:
-            self.present_position_value = data[0] | (data[1] & 0x7F) << 8
+            value = data[0] | (data[1] & 0x7F) << 8
             if data[1] & 0x80:
-                self.present_position_value *= -1
+                value *= -1
+            self._goal_value = value
+            self._stall_moving_left = self.stall_moving_reads
+            if not self.travelling:
+                self.present_position_value = value
 
     def _next_load(self):
         value = self.load_sequence[min(self._load_idx, len(self.load_sequence) - 1)]
