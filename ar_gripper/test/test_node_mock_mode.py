@@ -115,3 +115,187 @@ def test_the_action_server_does_not_share_the_nodes_default_callback_group(
         if node is not None:
             node.destroy_node()
         rclpy.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# What the driver measures, published: ~/gripper_state and JointState.effort
+# --------------------------------------------------------------------------- #
+OBSTRUCTION_TICKS = 3000  # between the open (150) and closed (4095) extremes
+TRAVEL_TICKS_PER_READ = 100  # the obstruction model only engages while travelling
+
+GRIPPER_STATE_TOPIC = "/ar_gripper/gripper_state"
+JOINT_STATES_TOPIC = "/joint_states"
+
+
+def _latched_qos():
+    from rclpy.qos import (
+        QoSDurabilityPolicy,
+        QoSHistoryPolicy,
+        QoSProfile,
+        QoSReliabilityPolicy,
+    )
+
+    return QoSProfile(
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=10,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    )
+
+
+class _Listener:
+    """Subscribes to both status topics and pumps the node's status timer by hand.
+
+    The node under test is not being spun by an executor here, so ``_send_status``
+    is called directly rather than waited for: that makes the test deterministic
+    (no dependence on the 0.2 s timer) while still going through the real
+    publishers, the real QoS and the real wire.
+    """
+
+    def __init__(self, node):
+        from ar_gripper_interfaces.msg import GripperState
+        from sensor_msgs.msg import JointState
+
+        self._node = node
+        self._sub_node = rclpy.create_node("test_gripper_state_listener")
+        self.gripper_states = []
+        self.joint_states = []
+        qos = _latched_qos()
+        self._sub_node.create_subscription(
+            GripperState, GRIPPER_STATE_TOPIC, self.gripper_states.append, qos
+        )
+        self._sub_node.create_subscription(
+            JointState, JOINT_STATES_TOPIC, self.joint_states.append, qos
+        )
+
+    def destroy(self):
+        self._sub_node.destroy_node()
+
+    def _drain(self):
+        """Spin until nothing more is waiting.
+
+        Necessary, not tidiness: spin_once dispatches one callback, so anything
+        published earlier and still queued would be handed over as if it were
+        the answer to the round just published -- a pre-grasp sample read as the
+        post-grasp one.
+        """
+        while True:
+            before = len(self.gripper_states) + len(self.joint_states)
+            rclpy.spin_once(self._sub_node, timeout_sec=0.05)
+            if len(self.gripper_states) + len(self.joint_states) == before:
+                return
+
+    def next_pair(self, timeout_s=10.0):
+        """Publish one status round and return the (GripperState, JointState) pair."""
+        import time
+
+        self._drain()
+        self.gripper_states.clear()
+        self.joint_states.clear()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self._node._send_status()
+            self._drain()
+            if self.gripper_states and self.joint_states:
+                return self.gripper_states[-1], self.joint_states[-1]
+        raise AssertionError(
+            f"no status within {timeout_s:g}s "
+            f"(gripper_state: {len(self.gripper_states)}, "
+            f"joint_state: {len(self.joint_states)})"
+        )
+
+
+def test_gripper_state_and_joint_effort_report_a_stalled_grasp(
+    tmp_path, restore_mock_patches
+):
+    """Close onto an obstruction: the driver says so on a topic, not just in a result.
+
+    Everything asserted here was already measured before this test existed; it
+    was simply unreachable -- the effort and the stall went out in the
+    GripperCommand result, to a controller manager that drops them, and
+    JointState.effort was left empty.
+    """
+    from ar_gripper_interfaces.msg import GripperState
+    from control_msgs.action import GripperCommand
+
+    import ar_gripper.scripts.ar_gripper as nodemod
+    from ar_gripper.standalone import ARGripperStandalone
+
+    rclpy.init(args=["--ros-args", "--params-file", str(_write_params(tmp_path))])
+    node = None
+    listener = None
+    try:
+        node = nodemod.ARGripperNode()
+        listener = _Listener(node)
+        gripper = node._grippers[0]
+
+        # Nothing has been commanded yet, so "stopped before the requested
+        # position" has nothing to be measured against.
+        state, _joint = listener.next_pair()
+        assert state.name == "primary"
+        assert state.calibrated is True
+        assert state.object_detection_status == GripperState.UNKNOWN
+
+        # Put something in the fingers, then command them shut onto it.
+        servo = node._mock_bus[-1].servo(1)
+        servo.travel_ticks_per_read = TRAVEL_TICKS_PER_READ
+        servo.obstruction_ticks = OBSTRUCTION_TICKS
+        result = gripper._gripper_action_execute(
+            _FakeGoalHandle(0.0, 500.0, GripperCommand)
+        )
+
+        assert result.reached_goal is False
+        assert result.stalled is True
+        assert result.effort > 0.0
+
+        state, joint = listener.next_pair()
+        assert state.object_detection_status == GripperState.DETECTED_CLOSING
+        assert state.effort == pytest.approx(result.effort)
+        assert state.position == pytest.approx(result.position)
+        assert 0.0 < state.position < ARGripperStandalone.FINGER_OPEN_POS
+
+        # The standard sensor_msgs field for this, no longer empty -- and one
+        # entry per named joint, so the arrays stay index-aligned.
+        assert list(joint.name) == ["primary_ar_gripper_body_finger1"]
+        assert len(joint.effort) == len(joint.name)
+        assert len(joint.position) == len(joint.name)
+        assert joint.effort[0] == pytest.approx(state.effort)
+        assert joint.position[0] == pytest.approx(state.position)
+    finally:
+        if listener is not None:
+            listener.destroy()
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_gripper_state_reports_no_object_when_the_fingers_reach_the_goal(
+    tmp_path, restore_mock_patches
+):
+    from ar_gripper_interfaces.msg import GripperState
+    from control_msgs.action import GripperCommand
+
+    import ar_gripper.scripts.ar_gripper as nodemod
+
+    rclpy.init(args=["--ros-args", "--params-file", str(_write_params(tmp_path))])
+    node = None
+    listener = None
+    try:
+        node = nodemod.ARGripperNode()
+        listener = _Listener(node)
+        gripper = node._grippers[0]
+
+        result = gripper._gripper_action_execute(
+            _FakeGoalHandle(0.0, 500.0, GripperCommand)
+        )
+        assert result.reached_goal is True
+
+        state, _joint = listener.next_pair()
+        assert state.object_detection_status == GripperState.NO_OBJECT
+        assert state.position == pytest.approx(0.0, abs=1e-3)
+    finally:
+        if listener is not None:
+            listener.destroy()
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()

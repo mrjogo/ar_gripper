@@ -3,11 +3,11 @@ import json
 import logging
 import os
 import sys
-from math import isclose
 from threading import Lock, Thread
 from time import monotonic, sleep
 
 import rclpy
+from ar_gripper_interfaces.msg import GripperState
 from ar_gripper_interfaces.srv import SetHoldingTorque
 from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -106,6 +106,9 @@ class ARGripper:
 
     def _handle_calibrate_srv(self, _request, response):
         self._node.get_logger().info("Calibrate service: request received")
+        # Homing re-references position and moves the fingers itself, so
+        # whatever was commanded before it describes nothing still true.
+        self._standalone.goal_position_m = None
         if self.gripper.calibrate():
             self._node.get_logger().info(
                 "Calibrate service: request successfully completed"
@@ -129,6 +132,14 @@ class ARGripper:
         self._node.get_logger().info(f"Set holding torque to {request.torque}")
         response.success = True
         return response
+
+    def get_state(self):
+        """Live state snapshot (see ``ARGripperStandalone.get_state``)."""
+        return self._standalone.get_state()
+
+    def grasp_state(self, state=None):
+        """Live grasp state (see ``ARGripperStandalone.grasp_state``)."""
+        return self._standalone.grasp_state(state)
 
     def _handle_accepted_callback(self, goal_handle):
         with self._goal_lock:
@@ -186,11 +197,19 @@ class ARGripper:
             if goal_handle.request.command.max_effort == ARGripperStandalone.MIN_EFFORT:
                 command_msg = "Release torque"
                 self._node.get_logger().info(f"{command_msg}: start")
+                # Slack fingers are not on their way anywhere, so ~/gripper_state
+                # has no goal to measure "stopped short" against. The result
+                # below still compares against the requested position, exactly
+                # as it always has.
+                self._standalone.goal_position_m = None
                 succeeded = self.gripper.release()
                 self._node.get_logger().info("Release torque: done")
             else:
                 command_msg = "Go to position"
                 self._node.get_logger().info(f"{command_msg}: start")
+                # What ~/gripper_state measures "before the requested position"
+                # against, for as long as this goal is the last one commanded.
+                self._standalone.goal_position_m = goal_handle.request.command.position
                 request_position_percent = ARGripperStandalone.stroke_to_percent(
                     goal_handle.request.command.position
                 )
@@ -231,10 +250,18 @@ class ARGripper:
             result.effort = ARGripperStandalone.percent_to_effort(
                 self.gripper.get_effort()
             )
-            result.reached_goal = isclose(
-                result.position, goal_handle.request.command.position, abs_tol=0.001
+            # The same derivation ~/gripper_state publishes, so the two cannot
+            # drift into disagreeing about the same instant. Measured against
+            # the position this goal asked for -- which is what it has always
+            # been compared with, including for a release.
+            grasp = ARGripperStandalone.derive_grasp_state(
+                result.position,
+                result.effort,
+                goal_handle.request.command.position,
+                self.gripper.calibrated,
             )
-            result.stalled = not result.reached_goal and result.effort > 0
+            result.reached_goal = grasp.reached_goal
+            result.stalled = grasp.stalled
             goal_handle.succeed()
             self._goal_handle = None
 
@@ -617,6 +644,32 @@ class ARGripperNode(Node):
             JointState, "joint_states", joint_state_qos
         )
 
+        # Latch this one too, but for a reason of its own rather than by
+        # analogy with the topic above. The /joint_states argument is about
+        # *sharing* a topic -- one VOLATILE publisher there defeats latching
+        # for everyone. Nothing else publishes ~/gripper_state; this driver is
+        # the only thing that can know it. So the question is only whether a
+        # subscriber that arrives late should see the current state or wait for
+        # the next tick, and the answer is that it should see it: this is a
+        # level, not an event, and a consumer asking "am I holding something?"
+        # wants the answer on connect, not up to 200 ms later. The header stamp
+        # is there for anyone who needs to know how old the latched sample is.
+        #
+        # RELIABLE because at 5 Hz the cost is nothing and a dropped sample is
+        # a consumer reading a stale grasp. Depth is one sample per gripper,
+        # because they share a topic and are told apart by `name` -- KEEP_LAST
+        # 1 would latch only whichever gripper published last, and a late
+        # subscriber would never hear about the others.
+        gripper_state_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=max(1, len(self._grippers)),
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._gripper_state_pub = self.create_publisher(
+            GripperState, "~/gripper_state", gripper_state_qos
+        )
+
         self.create_timer(self.DIAG_UPDATE_INTERVAL_S, self._send_diagnostics)
         self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self._send_status)
         self.create_timer(
@@ -760,14 +813,47 @@ class ARGripperNode(Node):
             )
 
     def _send_status(self):
+        """Publish /joint_states and ~/gripper_state, once per gripper.
+
+        STATUS_UPDATE_INTERVAL_S (5 Hz) is enough for the gripper state even
+        though a grasp is over in well under a second, because what is
+        published is a LEVEL, not an edge: a gripper that stopped on an object
+        goes on reporting that it did until something commands it otherwise, so
+        there is no transition to sample fast enough to catch. A consumer that
+        needs to know *when* it happened has the header stamp.
+
+        One snapshot of the bus per gripper feeds both messages, so the two
+        cannot describe slightly different instants of the same gripper. That
+        snapshot is ARGripperStandalone.get_state(), whole, including the two
+        reads (ticks, temperature) neither message uses: one definition of
+        "read the gripper's state" is worth two extra bus transactions per
+        gripper per tick, which at 5 Hz is a rounding error next to the
+        diagnostics timer that is already reading temperature anyway.
+        """
         try:
+            stamp = self._stamp_now()
             state_msg = JointState()
-            state_msg.header.stamp = self._stamp_now()
+            state_msg.header.stamp = stamp
             for gripper in self._grippers:
-                pos_percent = gripper.gripper.get_position()
-                joint_pos = ARGripperStandalone.percent_to_stroke(pos_percent)
+                state = gripper.get_state()
+                grasp = gripper.grasp_state(state)
+
                 state_msg.name.append(f"{gripper.gripper.name}_ar_gripper_body_finger1")
-                state_msg.position.append(joint_pos)
+                state_msg.position.append(state["position_m"])
+                # The standard sensor_msgs field for the force the driver
+                # already measures. Appended for every gripper, unconditionally,
+                # so name/position/effort stay index-aligned.
+                state_msg.effort.append(state["effort_N"])
+
+                gripper_state = GripperState()
+                gripper_state.header.stamp = stamp
+                gripper_state.name = gripper.gripper.name
+                gripper_state.position = state["position_m"]
+                gripper_state.effort = state["effort_N"]
+                gripper_state.object_detection_status = grasp.object_detection_status
+                gripper_state.moving = state["moving"]
+                gripper_state.calibrated = state["calibrated"]
+                self._gripper_state_pub.publish(gripper_state)
 
             self._joint_state_pub.publish(state_msg)
         except Exception as e:

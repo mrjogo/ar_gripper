@@ -13,7 +13,23 @@ The gripper logic is split so it can be driven with or without ROS:
   and the position/effort unit maps.
 - `ar_gripper/scripts/ar_gripper.py` — the rclpy node, a thin shim over
   `ARGripperStandalone` that bridges it to the `GripperCommand` action, the
-  `calibrate` / `set_holding_torque` services, `/joint_states`, and diagnostics.
+  `calibrate` / `set_holding_torque` services, `/joint_states`,
+  `~/gripper_state`, and diagnostics.
+
+### Published state
+
+`/joint_states` carries the finger position (m) and effort (N) for every
+gripper. `~/gripper_state` (`ar_gripper_interfaces/GripperState`, 5 Hz, latched)
+adds what the position alone cannot say: whether the fingers stopped on an
+object and which way they were going when they did
+(`object_detection_status`), plus `moving` and `calibrated`. It is a level, not
+an event — a gripper that stopped on something keeps saying so until it is
+commanded otherwise.
+
+The same derivation backs the `GripperCommand` result's `reached_goal` /
+`stalled` and the topic's `object_detection_status`
+(`ARGripperStandalone.derive_grasp_state`), so they cannot disagree about the
+same instant.
 
 ## Non-ROS usage
 
