@@ -221,7 +221,7 @@ class StallDetector:
     measures flat at +0.0003 N over 5486 samples, identical free-running and
     pinned, and still 0.0004 N with 0.45 m of commanded drive error (~23 N at
     the 52 N/m the finger drive carried when this was measured; it has since
-    gone up 9x to 466.56 N/m, which changes the force and not the reading,
+    gone up 38x to 2000 N/m, which changes the force and not the reading,
     because the reading is not about force). The reading is not missing and
     there is no switch that turns it on -- force is simply the wrong question
     to ask of a joint limit. Contact reporting cannot answer it either, because a limit is
