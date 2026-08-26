@@ -18,11 +18,17 @@ hold ``/dev/ttyUSB0``. Exactly one owner at a time.
 import json
 import logging
 import os
+from collections import namedtuple
+from math import isclose
 
 from ar_gripper.feetech import USB2FeetechDevice
 from ar_gripper.gripper import CalibrationError, Gripper
 
 logger = logging.getLogger(__name__)
+
+#: What the fingers are doing right now, derived once and shared by every
+#: consumer (see ``ARGripperStandalone.derive_grasp_state``).
+GraspState = namedtuple("GraspState", "reached_goal stalled object_detection_status")
 
 
 class ARGripperStandalone:
@@ -55,6 +61,21 @@ class ARGripperStandalone:
     # (85 kg*cm * 9.8 m/s^2 * 0.01 m/cm) / 0.008 m
     MAX_EFFORT = 1041.25  # Newtons
     # For reference, "rated" effort is ~1/3 of stall torque: 347.0833 N
+
+    # How close to the commanded position counts as having reached it. 1 mm of
+    # a 50 mm stroke; the value the GripperCommand action result has always
+    # used, kept here so the topic cannot answer the same question differently.
+    GOAL_POSITION_TOL_M = 0.001
+
+    # Object-detection status values. These MIRROR the constants on
+    # ar_gripper_interfaces/GripperState, by name and by number -- this module
+    # is deliberately ROS-free (see the module docstring) so it cannot import
+    # them, and a non-ROS consumer needs them just as much as the node does.
+    # test_grasp_state.py asserts the two sets stay equal.
+    OBJECT_DETECTION_UNKNOWN = 0
+    OBJECT_DETECTION_DETECTED_OPENING = 1
+    OBJECT_DETECTION_DETECTED_CLOSING = 2
+    OBJECT_DETECTION_NO_OBJECT = 3
 
     def __init__(
         self,
@@ -99,6 +120,13 @@ class ARGripperStandalone:
         self._device = device
         self.gripper = Gripper(device, name, servo_id)
         self._holding_torque = self.gripper.HOLDING_TORQUE
+        # Last position this driver commanded, in metres, or None when nothing
+        # is outstanding (nothing commanded yet, torque released, just homed).
+        # Every command path below maintains it; the ROS node assigns it
+        # directly because its action drives ``self.gripper`` rather than going
+        # through ``set_goal``. Without it "stopped BEFORE the requested
+        # position" has nothing to be measured against.
+        self._goal_position_m = None
 
         if self._servo_position_path is not None:
             os.makedirs(os.path.dirname(self._servo_position_path), exist_ok=True)
@@ -170,6 +198,79 @@ class ARGripperStandalone:
             return self.percent_to_stroke(percent)
         raise ValueError(f"unit must be 'm', 'percent', or 'ticks', not {unit!r}")
 
+    @property
+    def goal_position_m(self):
+        """Last commanded position in metres, or ``None`` if none is outstanding."""
+        return self._goal_position_m
+
+    @goal_position_m.setter
+    def goal_position_m(self, value):
+        self._goal_position_m = None if value is None else float(value)
+
+    @classmethod
+    def derive_grasp_state(cls, position_m, effort_N, goal_position_m, calibrated):
+        """Decide, from one instant's measurements, what the fingers did.
+
+        The single definition of "reached the goal" / "stalled" / "detected an
+        object" in this driver. The GripperCommand action result and the
+        ``~/gripper_state`` topic both report those, about the same gripper, and
+        a consumer that saw them disagree would have no way to tell which was
+        right -- so there is one derivation and both call it.
+
+        The direction is read off the goal rather than tracked separately: a
+        move that stopped short stopped somewhere BETWEEN where it started and
+        where it was sent, so the sign of ``goal - position`` is the sign of the
+        travel that was interrupted. Closed is 0 m and open is 0.05 m, so a goal
+        below the current position was a close.
+
+        :param position_m: measured finger position, metres.
+        :param effort_N: measured effort, newtons.
+        :param goal_position_m: last commanded position in metres, or ``None``.
+        :param calibrated: whether position means anything yet.
+        :returns: a :class:`GraspState`.
+        """
+        commanded = goal_position_m is not None
+        reached_goal = commanded and isclose(
+            position_m, goal_position_m, abs_tol=cls.GOAL_POSITION_TOL_M
+        )
+        # Stopped short of where it was sent, while still pushing: something is
+        # in the way. Effort alone does not mean contact -- holding torque at
+        # the goal reads the same -- which is why both halves are required.
+        stalled = commanded and not reached_goal and effort_N > 0
+
+        if not commanded or not calibrated:
+            status = cls.OBJECT_DETECTION_UNKNOWN
+        elif reached_goal:
+            status = cls.OBJECT_DETECTION_NO_OBJECT
+        elif stalled:
+            status = (
+                cls.OBJECT_DETECTION_DETECTED_CLOSING
+                if goal_position_m < position_m
+                else cls.OBJECT_DETECTION_DETECTED_OPENING
+            )
+        else:
+            # Short of the goal and pushing against nothing: the move is still
+            # in flight. Nothing is decided until the fingers settle.
+            status = cls.OBJECT_DETECTION_UNKNOWN
+        return GraspState(reached_goal, stalled, status)
+
+    def grasp_state(self, state=None):
+        """Live :class:`GraspState`, measured against the last commanded goal.
+
+        :param state: a snapshot from :meth:`get_state` to reuse. A caller that
+            wants both should take one snapshot and pass it, rather than paying
+            for a second round of bus reads that would describe a slightly
+            different instant.
+        """
+        if state is None:
+            state = self.get_state()
+        return self.derive_grasp_state(
+            state["position_m"],
+            state["effort_N"],
+            self._goal_position_m,
+            state["calibrated"],
+        )
+
     def get_state(self):
         """Snapshot of gripper state as a plain dict (all reads are live)."""
         percent = self.gripper.get_position()
@@ -204,6 +305,7 @@ class ARGripperStandalone:
             else self.effort_to_percent(effort)
         )
         if blocking:
+            self._goal_position_m = self.percent_to_stroke(percent)
             return self.gripper.goto_position(
                 percent, closing_torque, holding_torque=self._holding_torque
             )
@@ -221,28 +323,41 @@ class ARGripperStandalone:
         For loop-rate policy control. Assumes torque is already enabled (e.g. by a
         prior ``set_goal`` / ``close``); this only writes the target position.
         """
-        self.gripper.servo.goal_position = int(ticks)
+        ticks = int(ticks)
+        self._goal_position_m = self.percent_to_stroke(self._to_percent(ticks, "ticks"))
+        self.gripper.servo.goal_position = ticks
 
     def open(self):
         """Fully open at full torque."""
+        self._goal_position_m = self.FINGER_OPEN_POS
         return self.gripper.open()
 
     def close(self):
         """Fully close at full torque (holding torque applied on stall)."""
+        self._goal_position_m = self.FINGER_CLOSED_POS
         return self.gripper.goto_position(
             0, self.gripper.MAX_TORQUE, holding_torque=self._holding_torque
         )
 
     def release(self):
         """Disable torque so the fingers go slack."""
+        # Slack fingers are not on their way anywhere: no goal is outstanding,
+        # and wherever they end up says nothing about what they stopped on.
+        self._goal_position_m = None
         return self.gripper.release()
 
     def halt(self):
         """Stop motion by commanding the current position as the goal."""
+        # The goal becomes wherever the fingers are, so nothing is outstanding
+        # and nothing was stopped short of anything.
+        self._goal_position_m = None
         return self.gripper.halt()
 
     def calibrate(self):
         """Run the homing routine; persist the new position on success."""
+        # Homing re-references position, and moves the fingers itself; whatever
+        # was commanded beforehand describes nothing that is still true.
+        self._goal_position_m = None
         result = self.gripper.calibrate()
         if result:
             self.save_position()
