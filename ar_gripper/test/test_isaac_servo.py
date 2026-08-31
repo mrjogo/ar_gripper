@@ -453,9 +453,9 @@ def test_a_joint_whose_reading_stays_put_is_stopped_after_the_window():
     while now < dt + MOVING_WINDOW_S:
         now += dt
         detector.update(0.05, 0.0500, 0.0, now)
-    assert (
-        not detector.moving
-    ), "a joint whose reading has not changed for a whole window is stopped"
+    assert not detector.moving, (
+        "a joint whose reading has not changed for a whole window is stopped"
+    )
 
 
 def test_the_first_quantum_crossing_refutes_stopped_at_the_start_of_a_move():
@@ -477,9 +477,9 @@ def test_the_first_quantum_crossing_refutes_stopped_at_the_start_of_a_move():
         now = step * dt
         target = speed * now
         position = _quantise(speed * max(0.0, now - dt))
-        assert not detector.update(
-            target, position, speed, now
-        ), f"a move that had just started was called stalled at t={now:.4f} s"
+        assert not detector.update(target, position, speed, now), (
+            f"a move that had just started was called stalled at t={now:.4f} s"
+        )
     assert detector.moving, "the joint never registered as moving"
 
 

@@ -146,7 +146,7 @@ def _latched_qos():
 class _Listener:
     """Subscribes to both status topics and pumps the node's status timer by hand.
 
-    The node under test is not being spun by an executor here, so ``_send_status``
+    The node under test is not being spun by an executor here, so ``publish_status``
     is called directly rather than waited for: that makes the test deterministic
     (no dependence on the 0.2 s timer) while still going through the real
     publishers, the real QoS and the real wire.
@@ -194,7 +194,7 @@ class _Listener:
         self.joint_states.clear()
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            self._node._send_status()
+            self._node.publish_status()
             self._drain()
             if self.gripper_states and self.joint_states:
                 return self.gripper_states[-1], self.joint_states[-1]

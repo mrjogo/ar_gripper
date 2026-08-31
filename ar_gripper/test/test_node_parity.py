@@ -120,7 +120,7 @@ def test_joint_states_publish(ros_node):
     fake.servo(SID).present_position_value = 2122  # 50% -> 0.025 m
     captured = []
     node._joint_state_pub.publish = lambda msg: captured.append(msg)
-    node._send_status()
+    node.publish_status()
     msg = captured[-1]
     assert list(msg.name) == [JOINT_NAME]
     assert list(msg.position) == pytest.approx([0.025])

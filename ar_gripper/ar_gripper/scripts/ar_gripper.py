@@ -267,6 +267,12 @@ class ARGripper:
 
             # Persist new encoder position
             self._standalone.save_position()
+            # Say so at once, rather than up to a tick later. The fingers have just
+            # stopped, and that is the moment a consumer deciding what is in them has to
+            # act on: whatever moves next is waiting on that decision, and every
+            # millisecond it spends unmade is a millisecond in which the arm can leave
+            # while the answer is still being worked out.
+            self._node.publish_status()
             return result
 
 
@@ -671,7 +677,7 @@ class ARGripperNode(Node):
         )
 
         self.create_timer(self.DIAG_UPDATE_INTERVAL_S, self._send_diagnostics)
-        self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self._send_status)
+        self.create_timer(self.STATUS_UPDATE_INTERVAL_S, self.publish_status)
         self.create_timer(
             self.SERVO_OVERLOAD_CHECK_INTERVAL_S, self._check_servo_overload
         )
@@ -812,15 +818,20 @@ class ARGripperNode(Node):
                 f"Exception while reading diagnostics: {e}", throttle_duration_sec=5.0
             )
 
-    def _send_status(self):
+    def publish_status(self):
         """Publish /joint_states and ~/gripper_state, once per gripper.
 
-        STATUS_UPDATE_INTERVAL_S (5 Hz) is enough for the gripper state even
-        though a grasp is over in well under a second, because what is
-        published is a LEVEL, not an edge: a gripper that stopped on an object
-        goes on reporting that it did until something commands it otherwise, so
-        there is no transition to sample fast enough to catch. A consumer that
-        needs to know *when* it happened has the header stamp.
+        What is published is a LEVEL -- a gripper that stopped on an object goes on
+        saying so until something commands it otherwise -- and the timer keeps that level
+        current for anyone watching. But the level is only interesting because of the edge
+        that produced it, and the interesting edges all land at one moment: the end of a
+        commanded move. So this is called there too, directly, and the timer is the
+        heartbeat rather than the only way anyone hears.
+
+        That is latency, not correctness. A consumer deciding what is in the fingers has
+        to decide before whatever moves next is allowed to move, and waiting out a tick to
+        be told something the driver already knew spends most of that budget on nothing.
+        The header stamp still says when it happened.
 
         One snapshot of the bus per gripper feeds both messages, so the two
         cannot describe slightly different instants of the same gripper. That
