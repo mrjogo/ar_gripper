@@ -28,6 +28,7 @@ from sensor_msgs.msg import JointState
 from ar_gripper.description import finger_velocity_limit_mps
 from ar_gripper.gripper import Deadline, Gripper
 from ar_gripper.mock import FakeServo
+from ar_gripper.standalone import ARGripperStandalone
 
 # Feetech register addresses for the two writes this backend needs to see but
 # that FakeServo has no constants for (they live as private attributes on a
@@ -735,6 +736,28 @@ class IsaacJointBus:
         msg.header.stamp = now.to_msg()
         msg.name.append(self._joint_name)
         msg.position.append(published)
+        # The torque limit travels with the position, because a position alone
+        # does not describe what this servo is doing. A Feetech runs a position
+        # loop in firmware and SATURATES its output at torque_limit; the driver
+        # then drops that limit to a holding value once a move completes, so the
+        # steady state of a grasp is set by the holding torque and the closing
+        # torque is a transient. A simulator given only the position has to
+        # invent the force, and a spring is the obvious thing to invent -- whose
+        # force is stiffness times how far past the object it was told to go,
+        # which is not a torque limit and does not behave like one.
+        #
+        # In newtons, because that is what the register value means once scaled
+        # and what a JointState effort field is defined to carry. Consumers that
+        # want the percentage can divide by MAX_EFFORT_N; consumers that ignore
+        # effort entirely are unaffected, which is every consumer today.
+        # Left EMPTY until a torque limit has actually been written, rather
+        # than defaulted to something: the field's absence is what tells a
+        # consumer "this driver is not telling you a force", and a fabricated
+        # zero or maximum would both be lies a simulator would act on.
+        if self.torque_limit_raw is not None:
+            msg.effort.append(
+                ARGripperStandalone.percent_to_effort(self.torque_limit_raw / 10.0)
+            )
         self._command_pub.publish(msg)
 
 
