@@ -687,7 +687,17 @@ class ARGripperNode(Node):
     # waiting for is the thing that makes simulated time advance. Generous,
     # since the usual reason for waiting at all is that the driver was started
     # while the stage was still coming up.
-    SIMULATOR_WAIT_S = 30.0
+    #
+    # 30 s was not generous enough, and the way it failed was expensive. A
+    # simulator's start is minutes rather than seconds when its shader cache is
+    # cold -- measured anywhere from 30 s to over three minutes on one machine
+    # for one scene. The driver would give up, exit 1, and take the gripper out
+    # of a bring-up that was otherwise seconds from succeeding, and the log line
+    # blames a missing simulator, which reads like the stage failed rather than
+    # like this number being short. Nothing is bought by keeping it low: the wait
+    # ends on the first sample, so a fast start still proceeds immediately, and a
+    # simulator that genuinely never publishes still fails here.
+    SIMULATOR_WAIT_S = 300.0
     _SIMULATOR_POLL_S = 0.05
 
     def _wait_for_simulator(self, joint_bus):
