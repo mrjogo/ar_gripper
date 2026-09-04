@@ -83,14 +83,42 @@ def test_uncalibrated_is_unknown():
     assert state.object_detection_status == SA.OBJECT_DETECTION_UNKNOWN
 
 
-def test_short_of_the_goal_under_no_load_is_unknown():
-    """Still travelling: nothing is decided until the fingers settle."""
+def test_short_of_a_closing_goal_under_no_load_reports_closing():
+    """Still travelling inward: no contact decided, but the direction is known."""
     state = SA.derive_grasp_state(
         position_m=0.03, effort_N=0.0, goal_position_m=CLOSED, calibrated=True
     )
     assert state.reached_goal is False
     assert state.stalled is False
-    assert state.object_detection_status == SA.OBJECT_DETECTION_UNKNOWN
+    assert state.object_detection_status == SA.OBJECT_DETECTION_CLOSING
+
+
+def test_short_of_an_opening_goal_under_no_load_reports_opening():
+    """The case the fingers pass through on every release.
+
+    They leave a stall, travel under no load, and arrive. Reported as UNKNOWN it
+    was indistinguishable from the fingers running inward after losing what they
+    were pushing on -- which is the opposite event and wants the opposite
+    response.
+    """
+    state = SA.derive_grasp_state(
+        position_m=0.02, effort_N=0.0, goal_position_m=OPEN, calibrated=True
+    )
+    assert state.reached_goal is False
+    assert state.stalled is False
+    assert state.object_detection_status == SA.OBJECT_DETECTION_OPENING
+
+
+def test_travelling_and_stalled_differ_only_in_contact():
+    """Same goal, same position, load or not: the direction must not change."""
+    travelling = SA.derive_grasp_state(
+        position_m=0.03, effort_N=0.0, goal_position_m=CLOSED, calibrated=True
+    )
+    stalled = SA.derive_grasp_state(
+        position_m=0.03, effort_N=GRASP_FORCE_N, goal_position_m=CLOSED, calibrated=True
+    )
+    assert travelling.object_detection_status == SA.OBJECT_DETECTION_CLOSING
+    assert stalled.object_detection_status == SA.OBJECT_DETECTION_DETECTED_CLOSING
 
 
 def test_status_constants_match_the_message():
@@ -104,6 +132,34 @@ def test_status_constants_match_the_message():
     assert SA.OBJECT_DETECTION_DETECTED_OPENING == GripperState.DETECTED_OPENING
     assert SA.OBJECT_DETECTION_DETECTED_CLOSING == GripperState.DETECTED_CLOSING
     assert SA.OBJECT_DETECTION_NO_OBJECT == GripperState.NO_OBJECT
+    assert SA.OBJECT_DETECTION_OPENING == GripperState.OPENING
+    assert SA.OBJECT_DETECTION_CLOSING == GripperState.CLOSING
+
+
+def test_unknown_means_only_that_there_is_nothing_to_answer():
+    """The three statuses are disjoint, and UNKNOWN is the narrow one.
+
+    It used to absorb every in-flight move as well, which made it the commonest
+    value on the topic and the least informative.
+    """
+    assert (
+        SA.derive_grasp_state(
+            position_m=0.02, effort_N=0.0, goal_position_m=None, calibrated=True
+        ).object_detection_status
+        == SA.OBJECT_DETECTION_UNKNOWN
+    )
+    assert (
+        SA.derive_grasp_state(
+            position_m=0.02, effort_N=0.0, goal_position_m=OPEN, calibrated=False
+        ).object_detection_status
+        == SA.OBJECT_DETECTION_UNKNOWN
+    )
+    assert (
+        SA.derive_grasp_state(
+            position_m=0.02, effort_N=0.0, goal_position_m=OPEN, calibrated=True
+        ).object_detection_status
+        != SA.OBJECT_DETECTION_UNKNOWN
+    )
 
 
 # --------------------------------------------------------------------------- #

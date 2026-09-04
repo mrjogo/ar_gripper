@@ -20,11 +20,20 @@ The gripper logic is split so it can be driven with or without ROS:
 
 `/joint_states` carries the finger position (m) and effort (N) for every
 gripper. `~/gripper_state` (`ar_gripper_interfaces/GripperState`, 5 Hz, latched)
-adds what the position alone cannot say: whether the fingers stopped on an
-object and which way they were going when they did
-(`object_detection_status`), plus `moving` and `calibrated`. It is a level, not
-an event — a gripper that stopped on something keeps saying so until it is
-commanded otherwise.
+adds what the position alone cannot say: which way the fingers are being sent
+and whether something stopped them on the way (`object_detection_status`), plus
+`moving` and `calibrated`. It is a level, not an event — a gripper that stopped
+on something keeps saying so until it is commanded otherwise.
+
+Direction is reported whether or not anything is in the way, which is why there
+are six values rather than Robotiq's four: `OPENING`/`CLOSING` for a move in
+flight, `DETECTED_OPENING`/`DETECTED_CLOSING` once something stops it,
+`NO_OBJECT` on arrival, and `UNKNOWN` only when the question has no answer —
+nothing commanded yet, or an uncalibrated position that is not referenced to
+anything. A consumer watching a held object needs the in-flight direction: the
+fingers running inward because what they were pushing on has gone, and the
+fingers travelling apart because they were told to let go, are otherwise the
+same reading.
 
 The same derivation backs the `GripperCommand` result's `reached_goal` /
 `stalled` and the topic's `object_detection_status`

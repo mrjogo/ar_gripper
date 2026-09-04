@@ -76,6 +76,8 @@ class ARGripperStandalone:
     OBJECT_DETECTION_DETECTED_OPENING = 1
     OBJECT_DETECTION_DETECTED_CLOSING = 2
     OBJECT_DETECTION_NO_OBJECT = 3
+    OBJECT_DETECTION_OPENING = 4
+    OBJECT_DETECTION_CLOSING = 5
 
     def __init__(
         self,
@@ -223,6 +225,13 @@ class ARGripperStandalone:
         travel that was interrupted. Closed is 0 m and open is 0.05 m, so a goal
         below the current position was a close.
 
+        Direction is reported whether or not anything stopped the fingers, which
+        is what separates ``OPENING``/``CLOSING`` from ``DETECTED_OPENING``/
+        ``DETECTED_CLOSING``: the first pair says which way the fingers are being
+        sent, the second adds that something is in the way. ``UNKNOWN`` is
+        reserved for the cases where the question genuinely has no answer --
+        nothing commanded, or a position that is not referenced to anything.
+
         :param position_m: measured finger position, metres.
         :param effort_N: measured effort, newtons.
         :param goal_position_m: last commanded position in metres, or ``None``.
@@ -238,6 +247,7 @@ class ARGripperStandalone:
         # the goal reads the same -- which is why both halves are required.
         stalled = commanded and not reached_goal and effort_N > 0
 
+        closing = commanded and goal_position_m < position_m
         if not commanded or not calibrated:
             status = cls.OBJECT_DETECTION_UNKNOWN
         elif reached_goal:
@@ -245,13 +255,23 @@ class ARGripperStandalone:
         elif stalled:
             status = (
                 cls.OBJECT_DETECTION_DETECTED_CLOSING
-                if goal_position_m < position_m
+                if closing
                 else cls.OBJECT_DETECTION_DETECTED_OPENING
             )
         else:
-            # Short of the goal and pushing against nothing: the move is still
-            # in flight. Nothing is decided until the fingers settle.
-            status = cls.OBJECT_DETECTION_UNKNOWN
+            # Short of the goal and pushing against nothing: the move is still in
+            # flight, and nothing is decided about CONTACT until the fingers
+            # settle. The direction is decided, though, and it is reported.
+            #
+            # This used to be UNKNOWN, which is a different claim -- "no command
+            # has ever been issued" -- and collapsing the two lost the only thing
+            # that distinguishes a release from a loss. Both begin with the
+            # fingers leaving a stall and travelling under no load; they differ
+            # solely in which way they were sent, which is known here and was
+            # being thrown away.
+            status = (
+                cls.OBJECT_DETECTION_CLOSING if closing else cls.OBJECT_DETECTION_OPENING
+            )
         return GraspState(reached_goal, stalled, status)
 
     def grasp_state(self, state=None):
