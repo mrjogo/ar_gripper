@@ -255,6 +255,27 @@ def test_shutting_the_node_down_stops_a_drive_that_is_still_pushing(
     assert _writes(fake)[-1] == (TORQUE_SWITCH, [TORQUE_OFF])
 
 
+def test_shutdown_cuts_torque_even_when_stopping_the_drive_fails(make_node):
+    """The release must not depend on the stop having got as far as its own.
+
+    A close can also be in flight on another thread at shutdown, which
+    ``finger_service_open_stop`` knows nothing about.
+    """
+    node, fake, _saved = make_node(finger_service=True)
+    gripper = _gripper(node)
+
+    def explode():
+        raise RuntimeError("the bus went away")
+
+    gripper.gripper.finger_service_open_stop = explode
+    fake.trace.clear()
+
+    make_node.built.remove(node)
+    node.destroy_node()  # must not raise
+
+    assert _writes(fake)[-1] == (TORQUE_SWITCH, [TORQUE_OFF])
+
+
 def test_finger_service_never_writes_the_saved_position_file(make_node, frozen_clock):
     """The next startup has to fail verify_calibrated and rehome. A file stops that."""
     from std_srvs.srv import Empty, SetBool, Trigger

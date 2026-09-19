@@ -238,11 +238,15 @@ class ARGripper:
             )
         else:
             position = gripper.finger_service_open_stop()
+            # Success reports the state of the FINGERS, which is what the
+            # operator is asking about; a position that could not be read back
+            # does not make them any less slack.
             response.success = True
-            response.message = (
-                f"open drive stopped, torque off; servo position {position} "
-                "(re-referenced during the drive, so this is a raw count and not "
-                "a calibrated position)"
+            response.message = "open drive stopped, torque off; " + (
+                "the servo position could not be read back (see the log)"
+                if position is None
+                else f"servo position {position} (re-referenced during the "
+                "drive, so this is a raw count and not a calibrated position)"
             )
         self._node.get_logger().info(response.message)
         return response
@@ -284,9 +288,28 @@ class ARGripper:
         Deliberately NOT a blanket release. Outside finger-service mode the
         fingers may be holding something at shutdown, and cutting torque there
         would drop it.
+
+        Inside the mode, though, the release is unconditional and does not
+        depend on the stop above it having got as far as its own: a close may
+        be in flight on another thread, which ``finger_service_open_stop``
+        knows nothing about, and the stop can itself fail on the bus. Nothing
+        here may raise -- this runs from ``destroy_node``, which has to finish.
         """
-        if self._finger_service:
+        if not self._finger_service:
+            return
+        try:
             self.gripper.finger_service_open_stop()
+        except Exception as exc:
+            self._node.get_logger().error(
+                f"Could not stop the finger-service drive cleanly: {exc!r}"
+            )
+        try:
+            self.gripper.release()
+        except Exception as exc:
+            self._node.get_logger().error(
+                f"Could not cut torque on shutdown: {exc!r} -- THE MOTOR MAY "
+                "STILL BE DRIVING; power the servo down"
+            )
 
     def get_state(self):
         """Live state snapshot (see ``ARGripperStandalone.get_state``)."""

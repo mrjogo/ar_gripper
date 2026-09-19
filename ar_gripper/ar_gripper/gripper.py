@@ -301,7 +301,8 @@ class Gripper:
         :returns: the servo's present position, which is NOT a calibrated
             position: the drive re-references the encoder as it goes, so the
             number says where the count stands, not where the fingers are in a
-            stroke that no longer exists.
+            stroke that no longer exists. ``None`` if it could not be read --
+            the stop itself still succeeded, and never raises.
         """
         with self._finger_service_lock:
             self._finger_service_stop.set()
@@ -318,8 +319,19 @@ class Gripper:
         # Unconditional, and after the join rather than instead of the loop's
         # own release: the loop cuts torque when it ends on its own bound, and
         # this covers the case where there was no loop at all.
-        self.release()
-        return self.servo.present_position
+        self._release_after_service("open drive")
+        try:
+            return self.servo.present_position
+        except Exception as exc:
+            # Reported, never raised. Torque is already off by this point, so
+            # the fingers are safe and the stop SUCCEEDED -- failing the call
+            # over a read would tell an operator the opposite of the truth at
+            # the moment they most need to believe it.
+            logger.exception(
+                f"finger service: torque is off, but the servo position could "
+                f"not be read back: {exc!r}"
+            )
+            return None
 
     def finger_service_close(self):
         """Close gently for ``FINGER_SERVICE_CLOSE_S``, then cut torque.
@@ -347,20 +359,28 @@ class Gripper:
             both are reported rather than a difference.
         """
         servo = self.servo
-        before = servo.present_position
         logger.info(
             f"finger service: closing gripper {self.name} for "
             f"{self.FINGER_SERVICE_CLOSE_S:g} s at "
             f"{self.FINGER_SERVICE_TORQUE:g}% torque"
         )
-        self._prepare_finger_service()
-        servo.reset_current_position()
-        servo.goal_position = self._POSITION_MAX
-        deadline = Deadline(self.FINGER_SERVICE_CLOSE_S)
-        while not deadline.expired():
-            time.sleep(self._WAIT_CHECK_TIME_S)
-        after = servo.present_position
-        self.release()
+        # try/finally, and NOT try/except: the thing being guarded against is
+        # anything at all interrupting the poll below while a closing goal is
+        # standing at torque -- on an operator's fingers. A KeyboardInterrupt
+        # (launch teardown, Ctrl-C) is the likeliest such thing and is not an
+        # Exception, so only a finally covers it. The error itself is left to
+        # propagate; the caller needs to hear about it.
+        try:
+            before = servo.present_position
+            self._prepare_finger_service()
+            servo.reset_current_position()
+            servo.goal_position = self._POSITION_MAX
+            deadline = Deadline(self.FINGER_SERVICE_CLOSE_S)
+            while not deadline.expired():
+                time.sleep(self._WAIT_CHECK_TIME_S)
+            after = servo.present_position
+        finally:
+            self._release_after_service("close")
         logger.info(
             f"finger service: close done; servo was {before}, re-referenced to "
             f"{self.RESET_POSITION} for the move and now reads {after}"
@@ -379,9 +399,18 @@ class Gripper:
         """
         servo = self.servo
         servo.torque_limit = self.FINGER_SERVICE_TORQUE
-        servo.min_position_limit = 0
-        servo.max_position_limit = self._POSITION_MAX
-        servo.position_correction = 0
+        # The three limit registers live in EEPROM, so they are read first and
+        # written only on a change -- the same treatment, and for the same
+        # reason, that ``_init_servo`` already gives the configuration
+        # registers it writes. ``_calibrate`` writes them outright, which is
+        # fine there because it runs once per bring-up; here a close is a
+        # button an operator presses as many times as it takes to seat a
+        # finger, and each press would otherwise be three EEPROM writes of
+        # values that are already correct. ``torque_limit`` above is RAM and
+        # stays a plain write.
+        self._set_if_different(servo, "min_position_limit", 0)
+        self._set_if_different(servo, "max_position_limit", self._POSITION_MAX)
+        self._set_if_different(servo, "position_correction", 0)
         # Nothing the driver knows about position survives this: the fingers
         # are about to leave the carriage, or arrive in it somewhere new. Said
         # here rather than inferred later, so ~/gripper_state reports
@@ -389,26 +418,79 @@ class Gripper:
         # happened.
         self._calibrated = False
 
+    def _release_after_service(self, what):
+        """Cut torque, and make a failure to do so impossible to miss.
+
+        Called from the ``finally`` of both service motions, so it runs on the
+        failure paths too -- which is exactly when the bus is most likely to be
+        the thing that failed. A release that fails must not replace the
+        original error (that one says what actually went wrong) and must not
+        pass silently either, because it means the motor is still driving
+        against a person. So: logged at error, loudly, and swallowed.
+
+        The exception's repr is in the MESSAGE as well, which ruff's TRY401
+        calls redundant and which is not redundant here: the handler that
+        forwards this module's logging to ROS
+        (``helpers.ConnectPythonLoggingToROS``) passes on ``record.msg`` and
+        reads nothing else, so ``exc_info`` never reaches the log the operator
+        is actually looking at. Without the repr they get "could not cut
+        torque" and no way to tell a serial timeout from a bad checksum. The
+        same applies to the other two ``logger.exception`` calls below.
+        """
+        try:
+            self.release()
+        except Exception as exc:
+            logger.exception(
+                f"finger service: could not cut torque after the {what}: {exc!r} "
+                "-- THE MOTOR MAY STILL BE DRIVING; power the servo down"
+            )
+
     def _drive_finger_service_open(self):
         """The open drive's background loop (see :meth:`finger_service_open`)."""
         servo = self.servo
         deadline = Deadline(self.FINGER_SERVICE_MAX_S)
         armed = False
-        while not self._finger_service_stop.is_set():
-            reason = deadline.expired()
-            if reason:
-                logger.warning(f"finger service: open drive ended by itself ({reason})")
-                break
-            if not armed or servo.present_position <= self._FINGER_SERVICE_REARM_TICKS:
-                servo.reset_current_position()
-                servo.goal_position = self._FINGER_SERVICE_OPEN_GOAL
-                armed = True
-            time.sleep(self._WAIT_CHECK_TIME_S)
-        self.release()
-        logger.info(
-            f"finger service: open drive stopped, servo reads "
-            f"{servo.present_position} (not a calibrated position)"
-        )
+        try:
+            while not self._finger_service_stop.is_set():
+                reason = deadline.expired()
+                if reason:
+                    logger.warning(
+                        f"finger service: open drive ended by itself ({reason})"
+                    )
+                    break
+                if (
+                    not armed
+                    or servo.present_position <= self._FINGER_SERVICE_REARM_TICKS
+                ):
+                    # Re-checked here rather than only at the top of the loop.
+                    # The read just above can block for as long as the bus's
+                    # retries take, and a stop landing inside that window would
+                    # otherwise be followed by one more reset + goal -- putting
+                    # torque back on after finger_service_open_stop() had
+                    # already cut it and returned. The window is not closed
+                    # outright (nothing between a check and a write can be),
+                    # but it shrinks from a retry timeout to a few
+                    # instructions, and the release below is the backstop for
+                    # what is left.
+                    if self._finger_service_stop.is_set():
+                        break
+                    servo.reset_current_position()
+                    servo.goal_position = self._FINGER_SERVICE_OPEN_GOAL
+                    armed = True
+                time.sleep(self._WAIT_CHECK_TIME_S)
+        except Exception as exc:
+            # A dying bus, most likely. Caught rather than left to threading's
+            # excepthook: without this the thread disappears with torque
+            # enabled and goal 0 still standing, the 60 s bound gone with it,
+            # and nothing anywhere saying so.
+            logger.exception(f"finger service: open drive failed: {exc!r}")
+        finally:
+            self._release_after_service("open drive")
+        # Deliberately not reporting the servo position here. A drive that is
+        # ending because the bus failed should not touch the bus again beyond
+        # the one write that makes it safe -- and the position is already on
+        # ~/gripper_state, and in what finger_service_open_stop() returns.
+        logger.info("finger service: open drive stopped, torque off")
 
     def set_torque(self, torque):
         if torque > self.MAX_TORQUE:

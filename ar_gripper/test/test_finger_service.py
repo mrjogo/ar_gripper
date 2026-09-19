@@ -104,32 +104,71 @@ def test_the_service_torque_is_the_calibration_torque():
 # --------------------------------------------------------------------------- #
 # Open: keep driving toward open, past the stop, until told to stop
 # --------------------------------------------------------------------------- #
+def _seed_calibrated_limits(gripper, fake):
+    """Leave the servo exactly as ``_calibrate`` leaves it, and clear the trace.
+
+    Not an arbitrary starting state: it is the one the gripper is actually in
+    when an operator decides the fingers need to come out. From here only
+    ``min_position_limit`` differs from what the service motion wants, which is
+    the point -- it is also the only one of the three that would refuse the
+    goal.
+    """
+    servo = gripper.servo
+    servo.min_position_limit = gripper._POSITION_MIN
+    servo.max_position_limit = gripper._POSITION_MAX
+    servo.position_correction = 0
+    fake.trace.clear()
+
+
 def test_the_open_drive_lifts_the_calibrated_limits_before_it_moves(
     service_gripper, frozen_clock
 ):
     """The calibrated stroke is about to stop being true, and it blocks the goal."""
     gripper, fake = service_gripper
+    _seed_calibrated_limits(gripper, fake)
 
     assert gripper.finger_service_open() is True
     assert _wait_for(lambda: _goals(fake))
 
+    # Nothing of the calibrated stroke is left in force.
+    assert gripper.servo.min_position_limit == 0
+    assert gripper.servo.max_position_limit == 4095
+    assert gripper.servo.position_correction == 0
+    assert gripper.servo.torque_limit == pytest.approx(gripper.FINGER_SERVICE_TORQUE)
+
+    # And the one register that would have refused the goal was lifted BEFORE
+    # the goal was written, not after it.
     writes = _writes(fake)
     first_goal = next(i for i, (addr, _) in enumerate(writes) if addr == GOAL_POSITION)
     before_the_move = writes[:first_goal]
 
     assert (MIN_POSITION_LIMIT, [0, 0]) in before_the_move
     assert any(
-        addr == MAX_POSITION_LIMIT and _word(data) == 4095
-        for addr, data in before_the_move
-    )
-    assert any(
-        addr == POSITION_CORRECTION and _word(data) == 0
-        for addr, data in before_the_move
-    )
-    assert any(
         addr == TORQUE_LIMIT and _word(data) == int(gripper.FINGER_SERVICE_TORQUE * 10)
         for addr, data in before_the_move
     )
+    # The other two were already where the service wants them, so they cost no
+    # EEPROM write at all -- see test_a_repeated_close_does_not_rewrite_....
+    already_right = [addr for addr, _ in writes]
+    assert MAX_POSITION_LIMIT not in already_right
+    assert POSITION_CORRECTION not in already_right
+
+
+def test_the_open_drive_lifts_limits_that_are_wrong_rather_than_merely_stale(
+    service_gripper, frozen_clock
+):
+    """`_set_if_different` skips a correct register; it must not skip a wrong one."""
+    gripper, fake = service_gripper
+    gripper.servo.min_position_limit = gripper._POSITION_MIN
+    gripper.servo.max_position_limit = 1000
+    gripper.servo.position_correction = 100
+
+    gripper.finger_service_open()
+    assert _wait_for(lambda: _goals(fake))
+
+    assert gripper.servo.min_position_limit == 0
+    assert gripper.servo.max_position_limit == 4095
+    assert gripper.servo.position_correction == 0
 
 
 def test_the_open_drive_goes_past_the_calibrated_open_stop(
@@ -269,6 +308,106 @@ def test_the_close_reports_where_the_fingers_were_and_where_they_ended(
     # (2048 == where it started the move), which is the only zero the move had.
     assert before == 1234
     assert after > RESET_POSITION
+
+
+def test_a_repeated_close_does_not_rewrite_the_eeprom_limits(service_gripper):
+    """The limit registers live in EEPROM, and a close is a button an operator presses."""
+    gripper, fake = service_gripper
+
+    gripper.finger_service_close()
+    fake.trace.clear()
+    gripper.finger_service_close()
+
+    written = [addr for addr, _ in _writes(fake)]
+    assert MIN_POSITION_LIMIT not in written
+    assert MAX_POSITION_LIMIT not in written
+    assert POSITION_CORRECTION not in written
+    # The move itself still happened; only the unchanged registers were skipped.
+    assert _goals(fake)
+
+
+# --------------------------------------------------------------------------- #
+# When something fails mid-motion: torque comes off anyway
+#
+# The fingers are being held by a person. A driver that stops driving because
+# it crashed is fine; a driver that crashes while still driving is not, and
+# nothing above the driver can tell the difference from the outside.
+# --------------------------------------------------------------------------- #
+def _fail_bus_reads_of(servo, addr):
+    """Make the fake servo's reads of one register fail, as a dying bus does.
+
+    Reads only: ``release()`` is a WRITE, so this leaves the driver able to cut
+    torque -- which is the whole question. A bus too broken to write at all is
+    a different failure, and there is nothing the driver can do about that one.
+    """
+    import serial
+
+    original = servo.read
+
+    def read(address, count):
+        if address == addr:
+            raise serial.SerialException("injected bus failure")
+        return original(address, count)
+
+    servo.read = read
+
+
+class _ExplodingClock:
+    """Driver clock whose ``sleep`` raises once a poll is under way.
+
+    ``time()`` is frozen, so nothing else can end the wait first; the only way
+    out is the error. Takes the exception as an argument because the point of
+    testing this with a ``finally`` rather than an ``except Exception`` is that
+    KeyboardInterrupt has to be covered too.
+    """
+
+    def __init__(self, error, after=2):
+        self._error = error
+        self._after = after
+        self.sleeps = 0
+
+    def time(self):
+        return 0.0
+
+    def sleep(self, _seconds):
+        self.sleeps += 1
+        if self.sleeps >= self._after:
+            raise self._error
+        real_time.sleep(0.001)
+
+
+def test_a_bus_failure_mid_drive_still_cuts_torque(service_gripper, frozen_clock):
+    """Otherwise the thread vanishes with torque enabled and goal 0 standing."""
+    from ar_gripper.mock import FakeServo
+
+    gripper, fake = service_gripper
+    _fail_bus_reads_of(fake.servo(SID), FakeServo.PRESENT_POSITION)
+
+    gripper.finger_service_open()
+
+    assert _wait_for(lambda: not gripper.finger_service_open_active)
+    assert _goals(fake) == [0]  # it did start driving, then lost the bus
+    assert _writes(fake)[-1] == (TORQUE_SWITCH, [TORQUE_OFF])
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("the bus went away"), KeyboardInterrupt()],
+    ids=["error", "ctrl-c"],
+)
+def test_a_failure_mid_close_still_cuts_torque(service_gripper, monkeypatch, error):
+    """Ctrl-C included, which is why this is a ``finally`` and not an ``except``."""
+    from ar_gripper import gripper as gripper_module
+    from ar_gripper.gripper import Gripper
+
+    gripper, fake = service_gripper
+    monkeypatch.setattr(gripper_module, "time", _ExplodingClock(error))
+
+    with pytest.raises(type(error)):
+        gripper.finger_service_close()
+
+    assert _goals(fake) == [Gripper._POSITION_MAX]  # a closing goal was standing
+    assert _writes(fake)[-1] == (TORQUE_SWITCH, [TORQUE_OFF])
 
 
 # --------------------------------------------------------------------------- #
