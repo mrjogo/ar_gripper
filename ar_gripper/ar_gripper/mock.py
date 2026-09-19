@@ -27,15 +27,18 @@ the homing loop find contact, e.g. ``mock_gripper(saved_position=None,
 load_sequence=[5, 15, 15, 0])``.
 
 Lower-level building blocks (``FakeServo``, ``FakeSerial``, ``FakeTime``,
-``install_fake_serial``, ``loopback_bus``) are exposed for finer control.
+``FrozenTime``, ``install_fake_serial``, ``loopback_bus``) are exposed for finer
+control.
 """
 
+import time as _real_time
 from contextlib import contextmanager
 
 __all__ = [
     "FakeServo",
     "FakeSerial",
     "FakeTime",
+    "FrozenTime",
     "HOMING_LOAD_SEQUENCE",
     "checksum",
     "install_fake_serial",
@@ -327,6 +330,35 @@ class FakeTime:
 
     def sleep(self, _seconds):
         self._t += self.step
+
+
+class FrozenTime:
+    """Driver clock that never advances; ``sleep`` yields in real time.
+
+    The opposite tool to ``FakeTime``. Every wait in ``gripper.py`` is a
+    deadline on the module-level ``time`` (see ``gripper.Deadline``), so a clock
+    that advances a step per call makes those deadlines arrive at once, and a
+    clock that never advances means none of them can arrive at all. The second
+    is what makes "this stops when it is told to" testable: with the bound out
+    of reach, the only thing that can end a bounded loop is the explicit stop,
+    so a test that ends it has proved the stop works rather than having raced
+    the timeout to the same observable state.
+
+    ``sleep`` yields for ``yield_s`` of REAL time rather than returning
+    immediately, so a driver thread polling on this clock does not spin a core
+    while the test decides what to do next.
+    """
+
+    def __init__(self, yield_s=0.001):
+        self.yield_s = yield_s
+        self.sleeps = 0
+
+    def time(self):
+        return 0.0
+
+    def sleep(self, _seconds):
+        self.sleeps += 1
+        _real_time.sleep(self.yield_s)
 
 
 def install_fake_serial(monkeypatch_or_none=None):

@@ -23,13 +23,20 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from sensor_msgs.msg import JointState
-from std_srvs.srv import Empty
+from std_srvs.srv import Empty, SetBool, Trigger
 
 from ar_gripper import tracing
 from ar_gripper.feetech import USB2FeetechDevice
 from ar_gripper.gripper import CalibrationError
 from ar_gripper.helpers import ConnectPythonLoggingToROS
 from ar_gripper.standalone import ARGripperStandalone
+
+#: Why a grasp or a calibration was turned down, and the one thing that undoes
+#: it. Said the same way by the action and by the calibrate service, because an
+#: operator who hits one will hit the other.
+FINGER_SERVICE_REFUSAL = (
+    "finger-service mode: restart without finger_service to grasp/calibrate"
+)
 
 
 class ARGripper:
@@ -41,10 +48,26 @@ class ARGripper:
     node's JointState / diagnostics timers. Behaviour is unchanged vs the
     pre-shim node: the unit maps and persistence format are shared, not
     duplicated.
+
+    ``finger_service`` swaps that surface for the one the gripper needs while
+    it is in pieces: startup calibration does not run, the action and the
+    calibrate service are refused, and the two finger_service_* services are
+    advertised in their place. Those drive ``self.gripper`` directly, as the
+    action already does -- they are motions rather than positions, so there is
+    nothing in ARGripperStandalone's vocabulary to express them with.
     """
 
-    def __init__(self, device, gripper_name, servo_id, servo_position_path, node):
+    def __init__(
+        self,
+        device,
+        gripper_name,
+        servo_id,
+        servo_position_path,
+        node,
+        finger_service=False,
+    ):
         self._node = node
+        self._finger_service = finger_service
         # Build the standalone WITHOUT calibrating yet, so the action/service
         # endpoints are advertised before the (potentially blocking) startup
         # calibration runs -- matching the pre-shim node's ordering.
@@ -67,6 +90,39 @@ class ARGripper:
             f"~/{gripper_name}/set_holding_torque",
             self._handle_set_holding_torque,
         )
+
+        self._finger_service_open_srv = None
+        self._finger_service_close_srv = None
+        if finger_service:
+            # Advertised ONLY in this mode. They move the fingers past the
+            # calibrated stop and leave the gripper uncalibrated, which is
+            # exactly right while it is being serviced and is a way to break a
+            # working gripper the rest of the time. A mode that has to be
+            # asked for is also the only thing that makes "nothing moved" true
+            # at startup, and that is the property the operator is relying on.
+            #
+            # Their own callback group, for the same reason the action server
+            # has one: finger_service_close occupies its callback for
+            # FINGER_SERVICE_CLOSE_S, and in the node's default
+            # MutuallyExclusiveCallbackGroup that would hold off the status,
+            # diagnostics and overload timers that share it -- the moment an
+            # operator is most likely to be watching /joint_states to see what
+            # the fingers are doing. One group for BOTH services rather than
+            # one each, so the two opposite motions cannot be commanded at the
+            # same time.
+            self._finger_service_callback_group = MutuallyExclusiveCallbackGroup()
+            self._finger_service_open_srv = self._node.create_service(
+                SetBool,
+                f"~/{gripper_name}/finger_service_open",
+                self._handle_finger_service_open,
+                callback_group=self._finger_service_callback_group,
+            )
+            self._finger_service_close_srv = self._node.create_service(
+                Trigger,
+                f"~/{gripper_name}/finger_service_close",
+                self._handle_finger_service_close,
+                callback_group=self._finger_service_callback_group,
+            )
 
         self._goal_lock = Lock()
         self._commanding_lock = Lock()
@@ -99,12 +155,35 @@ class ARGripper:
         # from the real one. What the simulator needed to make this possible
         # was a way to feel a hard stop that reports no force; see
         # isaac_servo.StallDetector.
-        try:
-            self._standalone.run_startup_calibration()
-        except CalibrationError:
-            sys.exit("Gripper calibration failed")
+        if finger_service:
+            # NOTHING MOVES. Not the rehome, not the saved-position check that
+            # would otherwise decide whether to rehome -- that check reads the
+            # encoder, but the encoder is what the jam invalidated, so its
+            # verdict is meaningless either way. The operator is standing at
+            # the gripper with a finger jammed in the carriage, and a startup
+            # that drives into that is the failure this mode exists to avoid.
+            self._node.get_logger().warn(
+                f"Gripper '{gripper_name}' is in FINGER-SERVICE mode: no startup "
+                "calibration, nothing has moved, and grasping and calibration are "
+                f"refused. Use ~/{gripper_name}/finger_service_open to drive the "
+                "fingers out past the open stop and "
+                f"~/{gripper_name}/finger_service_close to push new ones in, then "
+                "restart WITHOUT finger_service:=true to recalibrate."
+            )
+        else:
+            try:
+                self._standalone.run_startup_calibration()
+            except CalibrationError:
+                sys.exit("Gripper calibration failed")
 
     def _handle_calibrate_srv(self, _request, response):
+        if self._finger_service:
+            # std_srvs/Empty has nowhere to put a reason, so the log is the
+            # only channel there is. Nothing moves.
+            self._node.get_logger().warn(
+                f"Calibrate service refused -- {FINGER_SERVICE_REFUSAL}"
+            )
+            return response
         self._node.get_logger().info("Calibrate service: request received")
         # Homing re-references position and moves the fingers itself, so
         # whatever was commanded before it describes nothing still true.
@@ -133,6 +212,82 @@ class ARGripper:
         response.success = True
         return response
 
+    def _handle_finger_service_open(self, request, response):
+        """``true`` drives the fingers open past the stop; ``false`` stops, slack.
+
+        Held open-ended rather than given a distance, because how far the
+        carriage has to travel to let a finger out is a property of the jam,
+        not of the gripper. The driver's own ``FINGER_SERVICE_MAX_S`` is the
+        backstop for a ``false`` that never arrives.
+        """
+        gripper = self.gripper
+        if request.data:
+            if not gripper.finger_service_open():
+                response.success = False
+                response.message = (
+                    "finger-service open drive is already running; send data: "
+                    "false to stop it"
+                )
+                self._node.get_logger().warn(response.message)
+                return response
+            response.success = True
+            response.message = (
+                f"driving open at {gripper.FINGER_SERVICE_TORQUE:g}% torque for up "
+                f"to {gripper.FINGER_SERVICE_MAX_S:g} s -- pull the fingers out, "
+                "then call this service again with data: false"
+            )
+        else:
+            position = gripper.finger_service_open_stop()
+            response.success = True
+            response.message = (
+                f"open drive stopped, torque off; servo position {position} "
+                "(re-referenced during the drive, so this is a raw count and not "
+                "a calibrated position)"
+            )
+        self._node.get_logger().info(response.message)
+        return response
+
+    def _handle_finger_service_close(self, _request, response):
+        """One short, gentle push toward closed, so new fingers can be seated."""
+        gripper = self.gripper
+        if gripper.finger_service_open_active:
+            # The two are opposite directions. Refused rather than queued
+            # behind the open drive, which has no end the operator has asked
+            # for yet.
+            response.success = False
+            response.message = (
+                "finger-service open drive is still running; send data: false to "
+                "finger_service_open first"
+            )
+            self._node.get_logger().warn(response.message)
+            return response
+        before, after = gripper.finger_service_close()
+        response.success = True
+        response.message = (
+            f"closed for {gripper.FINGER_SERVICE_CLOSE_S:g} s at "
+            f"{gripper.FINGER_SERVICE_TORQUE:g}% torque, torque off; servo "
+            f"position was {before}, re-referenced to {gripper.RESET_POSITION} for "
+            f"the move and now reads {after} "
+            f"({after - gripper.RESET_POSITION:+d} ticks toward closed)"
+        )
+        self._node.get_logger().info(response.message)
+        return response
+
+    def shutdown(self):
+        """Stop anything this gripper is still doing on a thread of its own.
+
+        Only the finger-service drive: it is the one thing here that outlives
+        the call that started it, and Ctrl-C kills its daemon thread without
+        the servo ever hearing about it -- leaving the motor pushing, at the
+        one moment when a person's hands are most likely to be in the fingers.
+
+        Deliberately NOT a blanket release. Outside finger-service mode the
+        fingers may be holding something at shutdown, and cutting torque there
+        would drop it.
+        """
+        if self._finger_service:
+            self.gripper.finger_service_open_stop()
+
     def get_state(self):
         """Live state snapshot (see ``ARGripperStandalone.get_state``)."""
         return self._standalone.get_state()
@@ -159,6 +314,13 @@ class ARGripper:
         goal_handle.execute()
 
     def _goal_callback(self, _goal_request):
+        if self._finger_service:
+            # Rejected at the gate rather than aborted in execute: the goal
+            # never becomes active, so nothing downstream waits on a result
+            # that was never going to come, and nothing commands the servo
+            # while an operator's hands are in the fingers.
+            self._node.get_logger().warn(f"Rejecting goal -- {FINGER_SERVICE_REFUSAL}")
+            return GoalResponse.REJECT
         self._node.get_logger().info("Received goal request")
         return GoalResponse.ACCEPT
 
@@ -407,6 +569,24 @@ class ARGripperNode(Node):
                 read_only=True,
             ),
         ).value
+        finger_service = self.declare_parameter(
+            "finger_service",
+            False,
+            ParameterDescriptor(
+                description=(
+                    "Bring the driver up for removing and refitting the fingers. "
+                    "NOTHING MOVES at startup: no calibration, no saved-position "
+                    "check, and the saved position is never written. Grasping and "
+                    "calibration are refused; two services are advertised instead "
+                    "-- finger_service_open drives the fingers open past the "
+                    "calibrated stop so they can be pulled out of the carriage, "
+                    "finger_service_close closes gently for a moment so new ones "
+                    "can be pushed in. Restart without it afterwards and the "
+                    "normal startup calibration rehomes the gripper."
+                ),
+                read_only=True,
+            ),
+        ).value
         if mock and isaac:
             # sys.exit(message) prints the message and exits cleanly, no
             # traceback -- matching the "Gripper calibration failed" startup
@@ -597,16 +777,26 @@ class ARGripperNode(Node):
                     )
                     self._isaac_bus[-1].servos[servo_ids[0]] = IsaacServo(joint_bus)
                     self._wait_for_simulator(joint_bus)
+                # Persistence off for the two hardware-free backends (their
+                # positions describe a model rather than a gripper), and off
+                # for finger service, whose whole job is to move the fingers
+                # somewhere the saved position must not follow. The next
+                # startup has to FAIL verify_calibrated and rehome; a file
+                # written during service is precisely what would talk it out
+                # of that, leaving a gripper that believes a stroke it no
+                # longer has.
+                saved_position_path = (
+                    None
+                    if (mock or isaac or finger_service)
+                    else os.path.expanduser(servo_position_path.value)
+                )
                 gripper = ARGripper(
                     device,
                     gripper_name,
                     servo_ids[0],
-                    (
-                        None
-                        if (mock or isaac)
-                        else os.path.expanduser(servo_position_path.value)
-                    ),
+                    saved_position_path,
                     self,
+                    finger_service=finger_service,
                 )
                 self.all_servos.append(gripper.gripper.servo)
                 self._grippers.append(gripper)
@@ -781,6 +971,11 @@ class ARGripperNode(Node):
             self.get_logger().error(f"could not write bus trace: {exc}")
 
     def destroy_node(self):
+        # First, because it is the only thing here that can still be moving
+        # the motor. getattr, because destroy_node also runs on a construction
+        # that failed before the list existed.
+        for gripper in getattr(self, "_grippers", []):
+            gripper.shutdown()
         self._write_bus_trace()
         self._shutdown_isaac_executor()
         return super().destroy_node()

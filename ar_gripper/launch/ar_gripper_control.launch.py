@@ -14,6 +14,7 @@ def launch_setup(context, *args, **kwargs):
     isaac = LaunchConfiguration("isaac")
     isaac_joint_states_topic = LaunchConfiguration("isaac_joint_states_topic")
     isaac_command_topic = LaunchConfiguration("isaac_command_topic")
+    finger_service = LaunchConfiguration("finger_service")
     bus_trace_path = LaunchConfiguration("bus_trace_path")
     bus_trace_sample_hz = LaunchConfiguration("bus_trace_sample_hz")
 
@@ -33,6 +34,7 @@ def launch_setup(context, *args, **kwargs):
                 "isaac_command_topic": ParameterValue(
                     isaac_command_topic, value_type=str
                 ),
+                "finger_service": ParameterValue(finger_service, value_type=bool),
                 "bus_trace_path": ParameterValue(bus_trace_path, value_type=str),
                 "bus_trace_sample_hz": ParameterValue(
                     bus_trace_sample_hz, value_type=float
@@ -107,6 +109,20 @@ def generate_launch_description():
         )
     )
 
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "finger_service",
+            default_value="false",
+            description=(
+                "Bring the driver up for removing and refitting the fingers. "
+                "Nothing moves at startup (no calibration, no saved-position "
+                "check, and the saved position is never written) and grasping and "
+                "calibration are refused; the finger_service_open / "
+                "finger_service_close services are advertised instead. Restart "
+                "without it afterwards to recalibrate."
+            ),
+        )
+    )
     declared_arguments.append(
         DeclareLaunchArgument(
             "bus_trace_path",

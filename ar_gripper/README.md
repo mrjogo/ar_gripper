@@ -40,6 +40,46 @@ The same derivation backs the `GripperCommand` result's `reached_goal` /
 (`ARGripperStandalone.derive_grasp_state`), so they cannot disagree about the
 same instant.
 
+## Finger service (removing and inserting fingers)
+
+A finger that jams mid-close leaves the fingers stuck in the carriage and the
+position calibration wrong. Getting out of that needs the servo to keep driving
+toward open — past the calibrated open stop — while you pull the fingers out,
+and then to close gently for a moment while you push new ones in.
+
+Bring the driver up in finger-service mode. **Nothing moves at startup**: no
+calibration, no saved-position check, and the saved position is never written.
+Grasping and the `calibrate` service are refused for as long as the mode lasts,
+so nothing else can command the gripper while your hands are in it.
+
+```bash
+ros2 launch ar_gripper ar_gripper_control.launch.py finger_service:=true
+```
+
+Drive the fingers open and pull them out. The push continues until you send
+`false`, or for 60 s, whichever comes first; sending `false` cuts torque:
+
+```bash
+ros2 service call /ar_gripper/primary/finger_service_open std_srvs/srv/SetBool "{data: true}"
+# ...pull the fingers out, then:
+ros2 service call /ar_gripper/primary/finger_service_open std_srvs/srv/SetBool "{data: false}"
+```
+
+Push the new fingers in against a short, gentle close. Each call is one 1.5 s
+push at the calibration torque, after which torque comes off; call it as many
+times as it takes:
+
+```bash
+ros2 service call /ar_gripper/primary/finger_service_close std_srvs/srv/Trigger
+```
+
+Then **restart without `finger_service:=true`**. Startup calibration finds that
+the servo has moved well past the saved position, so `verify_calibrated` fails
+and the gripper rehomes — which is what makes the new fingers' stroke real
+again.
+
+(Substitute your gripper's name for `primary` in both service names.)
+
 ## Non-ROS usage
 
 `ARGripperStandalone` needs only `pyserial`, so an external process (e.g. a

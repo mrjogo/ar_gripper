@@ -1,7 +1,7 @@
 import logging
 import time
 from math import isclose
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import monotonic as _real_monotonic
 
 from ar_gripper.feetech import FeetechSMSServo
@@ -85,6 +85,39 @@ class Gripper:
     # past INRUSH_TIME.
     _INRUSH_POLL_TIME_S = 0.005
 
+    # Where reset_current_position() leaves the encoder. Not a choice this
+    # driver makes -- it is what the servo does when the overloaded torque
+    # switch register is written with its midpoint code.
+    RESET_POSITION = 2048
+
+    # -- finger service ------------------------------------------------------
+    # Removing and refitting the fingers. Not a move to a position: the fingers
+    # are driven against the person doing the work, for as long as the work
+    # takes, and they stop when they are told to.
+    #
+    # The torque is the one calibration already uses. That value was chosen to
+    # push the carriage into a hard stop without hurting anything, which is the
+    # same requirement here from both ends -- enough to keep the carriage
+    # moving while a finger is worked out of it, low enough that a hand can
+    # hold it still. Aliased rather than copied so the two cannot drift apart
+    # and leave the service push harder than the one the driver already trusts
+    # against a stop.
+    FINGER_SERVICE_TORQUE = _CALIBRATION_TORQUE
+    # Longest the open drive will push without being told to stop. Long enough
+    # for a two-handed job, short enough that a service call forgotten with the
+    # operator out of the room does not leave the motor pushing all afternoon.
+    FINGER_SERVICE_MAX_S = 60.0
+    # One short push, not a hold: long enough to seat a finger being pushed in,
+    # short enough that it is over before a hand could be caught by it.
+    FINGER_SERVICE_CLOSE_S = 1.5
+    # Open is the LOW-count side (see _POSITION_MIN / _POSITION_MAX), and 0 is
+    # below the calibrated open stop -- which is the point.
+    _FINGER_SERVICE_OPEN_GOAL = 0
+    # Re-reference and re-command once the encoder gets this close to the goal,
+    # so the drive never runs out of travel while the operator is still pulling.
+    _FINGER_SERVICE_REARM_TICKS = 100
+    _FINGER_SERVICE_JOIN_S = 5.0
+
     def __init__(self, device, name, servo_id):
         self.name = name
         self.servo = FeetechSMSServo(device, servo_id)
@@ -92,6 +125,9 @@ class Gripper:
         self._calibrated = False
         self._aborted = False
         self._aborted_lock = Lock()
+        self._finger_service_lock = Lock()
+        self._finger_service_stop = Event()
+        self._finger_service_thread = None
 
     @property
     def calibrated(self):
@@ -188,6 +224,191 @@ class Gripper:
         servo.min_position_limit = self._POSITION_MIN
         self._calibrated = True
         logger.info(f"calibrating gripper {self.name} complete")
+
+    # -- finger service -------------------------------------------------------------
+    @property
+    def finger_service_open_active(self):
+        """Whether an open drive is currently pushing."""
+        thread = self._finger_service_thread
+        return thread is not None and thread.is_alive()
+
+    def finger_service_open(self):
+        """Keep driving the fingers open, past the calibrated stop, until stopped.
+
+        For pulling the fingers out of the carriage: the servo has to go on
+        pushing the carriage toward open for as long as the operator needs to
+        work them free, which is neither a distance nor a duration the driver
+        can know in advance. So this starts a background push and returns; the
+        caller ends it with :meth:`finger_service_open_stop`, or
+        ``FINGER_SERVICE_MAX_S`` ends it on its own.
+
+        "Toward open" is the low-count side -- ``_POSITION_MIN`` (150) is open
+        and ``_POSITION_MAX`` (4095) is closed -- so the goal is 0, below the
+        calibrated open stop.
+
+        Getting there needs the same two things ``_calibrate`` needs before its
+        own hunt for the hard stop, for the same reasons:
+
+        * The calibrated limits come off (see :meth:`_prepare_finger_service`).
+          While ``min_position_limit`` is 150 the servo will not accept a goal
+          below it, and 150 is exactly where this has to go past.
+        * The encoder is re-referenced (``reset_current_position``) before each
+          goal is written. The servo counts multi-turn, so after a jam --
+          which is how the gripper got here -- ``present_position`` may be a
+          long way outside the calibrated stroke, and "0" would then be a goal
+          the carriage is already past, or thousands of ticks from. Resetting
+          first makes the count 2048 whatever happened, so writing 0 is always
+          a request to travel 2048 ticks toward open, and always means the same
+          thing. It is what ``_calibrate``'s homing loop does before every
+          attempt at 4095.
+
+        Re-referencing is also what makes the push unbounded rather than one
+        2048-tick move. When the encoder gets within ``_FINGER_SERVICE_REARM_TICKS``
+        of the goal the loop resets and commands again, so there is always more
+        travel available. A drive that is stalled against something does not
+        re-arm and does not need to -- it is already pushing.
+
+        :returns: ``True`` if a drive was started, ``False`` if one was already
+            running (this does not restart or extend it).
+        """
+        with self._finger_service_lock:
+            if self.finger_service_open_active:
+                logger.warning("finger service: open drive already running")
+                return False
+            logger.info(
+                f"finger service: driving gripper {self.name} open at "
+                f"{self.FINGER_SERVICE_TORQUE:g}% torque for up to "
+                f"{self.FINGER_SERVICE_MAX_S:g} s"
+            )
+            self._prepare_finger_service()
+            self._finger_service_stop.clear()
+            self._finger_service_thread = Thread(
+                target=self._drive_finger_service_open,
+                name=f"finger_service_open:{self.name}",
+                daemon=True,
+            )
+            self._finger_service_thread.start()
+            return True
+
+    def finger_service_open_stop(self):
+        """Stop the open drive and cut torque; report where the servo ended up.
+
+        Safe to call when nothing is running: torque comes off either way. That
+        is deliberate rather than defensive -- "stop" is what an operator with
+        their hands in the machine reaches for, and it has to mean slack
+        fingers whether or not the driver agrees that something was moving.
+
+        :returns: the servo's present position, which is NOT a calibrated
+            position: the drive re-references the encoder as it goes, so the
+            number says where the count stands, not where the fingers are in a
+            stroke that no longer exists.
+        """
+        with self._finger_service_lock:
+            self._finger_service_stop.set()
+            thread, self._finger_service_thread = self._finger_service_thread, None
+        # Joined outside the lock: the drive loop never takes it, but holding a
+        # lock across a join is how that stops being true by accident later.
+        if thread is not None:
+            thread.join(timeout=self._FINGER_SERVICE_JOIN_S)
+            if thread.is_alive():
+                logger.error(
+                    "finger service: open drive did not stop within "
+                    f"{self._FINGER_SERVICE_JOIN_S:g} s; cutting torque anyway"
+                )
+        # Unconditional, and after the join rather than instead of the loop's
+        # own release: the loop cuts torque when it ends on its own bound, and
+        # this covers the case where there was no loop at all.
+        self.release()
+        return self.servo.present_position
+
+    def finger_service_close(self):
+        """Close gently for ``FINGER_SERVICE_CLOSE_S``, then cut torque.
+
+        For pushing new (or re-seated) fingers in: a short push toward closed
+        gives the carriage something to seat against while the operator pushes,
+        and then gets out of the way. Fixed and short rather than started and
+        stopped, because there is nothing to wait for -- no stop to find, no
+        stall worth reporting -- and because a close that has to be stopped by
+        hand is a close that can be left running against a hand.
+
+        Blocks for the duration. Callable repeatedly; each call is one push.
+        Assumes no open drive is running (the caller refuses that combination;
+        the two are opposite directions and must not be commanded at once).
+
+        The encoder is re-referenced before the move for the reason described
+        on :meth:`finger_service_open` -- after a jam the count may be nowhere
+        near the calibrated stroke, and "4095" has to mean "2048 ticks toward
+        closed" rather than whatever it happens to mean.
+
+        :returns: ``(before, after)`` servo positions. ``before`` is read
+            BEFORE the re-reference, so it is where the count actually stood;
+            ``after`` is on the reference the move established (it started at
+            ``RESET_POSITION``). The two are not on the same zero, which is why
+            both are reported rather than a difference.
+        """
+        servo = self.servo
+        before = servo.present_position
+        logger.info(
+            f"finger service: closing gripper {self.name} for "
+            f"{self.FINGER_SERVICE_CLOSE_S:g} s at "
+            f"{self.FINGER_SERVICE_TORQUE:g}% torque"
+        )
+        self._prepare_finger_service()
+        servo.reset_current_position()
+        servo.goal_position = self._POSITION_MAX
+        deadline = Deadline(self.FINGER_SERVICE_CLOSE_S)
+        while not deadline.expired():
+            time.sleep(self._WAIT_CHECK_TIME_S)
+        after = servo.present_position
+        self.release()
+        logger.info(
+            f"finger service: close done; servo was {before}, re-referenced to "
+            f"{self.RESET_POSITION} for the move and now reads {after}"
+        )
+        return before, after
+
+    def _prepare_finger_service(self):
+        """Lift the calibrated limits, set the service torque, drop calibration.
+
+        Exactly what ``_calibrate`` does before it goes looking for the hard
+        stop, and for the same reason: the limits describe a stroke that is
+        about to stop being true, and while they are in force the servo will
+        not accept a goal outside them. ``position_correction`` goes with them
+        -- it is the offset that calibrated stroke is expressed in, so leaving
+        it set would silently shift every goal written afterwards.
+        """
+        servo = self.servo
+        servo.torque_limit = self.FINGER_SERVICE_TORQUE
+        servo.min_position_limit = 0
+        servo.max_position_limit = self._POSITION_MAX
+        servo.position_correction = 0
+        # Nothing the driver knows about position survives this: the fingers
+        # are about to leave the carriage, or arrive in it somewhere new. Said
+        # here rather than inferred later, so ~/gripper_state reports
+        # calibrated=False and goto_position refuses until a real rehome has
+        # happened.
+        self._calibrated = False
+
+    def _drive_finger_service_open(self):
+        """The open drive's background loop (see :meth:`finger_service_open`)."""
+        servo = self.servo
+        deadline = Deadline(self.FINGER_SERVICE_MAX_S)
+        armed = False
+        while not self._finger_service_stop.is_set():
+            reason = deadline.expired()
+            if reason:
+                logger.warning(f"finger service: open drive ended by itself ({reason})")
+                break
+            if not armed or servo.present_position <= self._FINGER_SERVICE_REARM_TICKS:
+                servo.reset_current_position()
+                servo.goal_position = self._FINGER_SERVICE_OPEN_GOAL
+                armed = True
+            time.sleep(self._WAIT_CHECK_TIME_S)
+        self.release()
+        logger.info(
+            f"finger service: open drive stopped, servo reads "
+            f"{servo.present_position} (not a calibrated position)"
+        )
 
     def set_torque(self, torque):
         if torque > self.MAX_TORQUE:

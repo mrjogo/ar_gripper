@@ -92,6 +92,25 @@ def fast_clock(monkeypatch):
 
 
 @pytest.fixture
+def frozen_clock(monkeypatch):
+    """Replace gripper.py's ``time`` with a clock that never advances.
+
+    ``fast_clock`` makes every bound in the driver arrive at once; this makes
+    none of them arrive at all, so a bounded loop can only be ended by the thing
+    that is supposed to end it. See ``ar_gripper.mock.FrozenTime``.
+
+    Installed *after* ``fast_clock`` when a test asks for both, so it wins --
+    request it second (or via a fixture that already built what it needs).
+    """
+    from ar_gripper import gripper
+    from ar_gripper.mock import FrozenTime
+
+    clock = FrozenTime()
+    monkeypatch.setattr(gripper, "time", clock)
+    return clock
+
+
+@pytest.fixture
 def make_gripper(fake_serials, fast_clock):
     """Build a real ``Gripper`` on a fresh FakeSerial (fast clock installed).
 
