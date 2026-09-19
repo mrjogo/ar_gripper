@@ -85,31 +85,26 @@ class Gripper:
     # past INRUSH_TIME.
     _INRUSH_POLL_TIME_S = 0.005
 
-    # Where reset_current_position() leaves the encoder. Not a choice this
-    # driver makes -- it is what the servo does when the overloaded torque
-    # switch register is written with its midpoint code.
-    RESET_POSITION = 2048
-
     # -- finger service ------------------------------------------------------
-    # Removing and refitting the fingers. Not a move to a position: the fingers
-    # are driven against the person doing the work, for as long as the work
-    # takes, and they stop when they are told to.
+    # Removing and refitting the fingers. Opening is a move: driven against the
+    # person pulling, for as long as the work takes, and stopped when told to.
+    # Closing is not a move at all -- the two fingers are racks on one pinion,
+    # so seating them evenly needs the pinion free to turn while a person
+    # pushes each one in by hand, not driven toward closed (which pushes only
+    # the finger already engaged and cocks the other against the carriage).
     #
     # The torque is the one calibration already uses. That value was chosen to
-    # push the carriage into a hard stop without hurting anything, which is the
-    # same requirement here from both ends -- enough to keep the carriage
+    # push the carriage into a hard stop without hurting anything, which is
+    # the same requirement the open drive has -- enough to keep the carriage
     # moving while a finger is worked out of it, low enough that a hand can
     # hold it still. Aliased rather than copied so the two cannot drift apart
-    # and leave the service push harder than the one the driver already trusts
-    # against a stop.
+    # and leave the open drive pushing harder than the one the driver already
+    # trusts against a stop.
     FINGER_SERVICE_TORQUE = _CALIBRATION_TORQUE
     # Longest the open drive will push without being told to stop. Long enough
     # for a two-handed job, short enough that a service call forgotten with the
     # operator out of the room does not leave the motor pushing all afternoon.
     FINGER_SERVICE_MAX_S = 60.0
-    # One short push, not a hold: long enough to seat a finger being pushed in,
-    # short enough that it is over before a hand could be caught by it.
-    FINGER_SERVICE_CLOSE_S = 1.5
     # Open is the LOW-count side (see _POSITION_MIN / _POSITION_MAX), and 0 is
     # below the calibrated open stop -- which is the point.
     _FINGER_SERVICE_OPEN_GOAL = 0
@@ -334,58 +329,46 @@ class Gripper:
             return None
 
     def finger_service_close(self):
-        """Close gently for ``FINGER_SERVICE_CLOSE_S``, then cut torque.
+        """Release torque so the pinion freewheels; report where the servo is.
 
-        For pushing new (or re-seated) fingers in: a short push toward closed
-        gives the carriage something to seat against while the operator pushes,
-        and then gets out of the way. Fixed and short rather than started and
-        stopped, because there is nothing to wait for -- no stop to find, no
-        stall worth reporting -- and because a close that has to be stopped by
-        hand is a close that can be left running against a hand.
+        Not a move: the two fingers are racks on one pinion, so inserting them
+        squarely needs the pinion free to turn while the operator pushes each
+        finger in by hand, not driven -- a driven close only pushes the finger
+        already engaged and cocks the other one against the carriage. So there
+        is nothing to wait for and nothing to command; this just cuts torque
+        and returns.
 
-        Blocks for the duration. Callable repeatedly; each call is one push.
-        Assumes no open drive is running (the caller refuses that combination;
-        the two are opposite directions and must not be commanded at once).
+        Callable repeatedly and safe to call whether or not anything is
+        currently driving, same as :meth:`finger_service_open_stop` -- "close"
+        here means "let the pinion turn", and that is true no matter what came
+        before it. Assumes no open drive is running (the caller refuses that
+        combination; the two are opposite requests and must not be issued at
+        once).
 
-        The encoder is re-referenced before the move for the reason described
-        on :meth:`finger_service_open` -- after a jam the count may be nowhere
-        near the calibrated stroke, and "4095" has to mean "2048 ticks toward
-        closed" rather than whatever it happens to mean.
-
-        :returns: ``(before, after)`` servo positions. ``before`` is read
-            BEFORE the re-reference, so it is where the count actually stood;
-            ``after`` is on the reference the move established (it started at
-            ``RESET_POSITION``). The two are not on the same zero, which is why
-            both are reported rather than a difference.
+        :returns: the servo's present position, on whatever reference was
+            already in force -- this does not re-reference the encoder, so the
+            number is only as meaningful as the calibration that was true a
+            moment ago and is now gone. ``None`` if it could not be read -- the
+            release itself still succeeded, and this never raises.
         """
-        servo = self.servo
         logger.info(
-            f"finger service: closing gripper {self.name} for "
-            f"{self.FINGER_SERVICE_CLOSE_S:g} s at "
-            f"{self.FINGER_SERVICE_TORQUE:g}% torque"
+            f"finger service: releasing gripper {self.name} so the pinion is "
+            "free -- push both fingers in by hand"
         )
-        # try/finally, and NOT try/except: the thing being guarded against is
-        # anything at all interrupting the poll below while a closing goal is
-        # standing at torque -- on an operator's fingers. A KeyboardInterrupt
-        # (launch teardown, Ctrl-C) is the likeliest such thing and is not an
-        # Exception, so only a finally covers it. The error itself is left to
-        # propagate; the caller needs to hear about it.
+        self._release_after_service("release")
+        self._calibrated = False
         try:
-            before = servo.present_position
-            self._prepare_finger_service()
-            servo.reset_current_position()
-            servo.goal_position = self._POSITION_MAX
-            deadline = Deadline(self.FINGER_SERVICE_CLOSE_S)
-            while not deadline.expired():
-                time.sleep(self._WAIT_CHECK_TIME_S)
-            after = servo.present_position
-        finally:
-            self._release_after_service("close")
-        logger.info(
-            f"finger service: close done; servo was {before}, re-referenced to "
-            f"{self.RESET_POSITION} for the move and now reads {after}"
-        )
-        return before, after
+            return self.servo.present_position
+        except Exception as exc:
+            # Reported, never raised, for the same reason
+            # finger_service_open_stop gives: torque is already off, so the
+            # release SUCCEEDED, and failing the call over a read would tell
+            # the operator the opposite of the truth.
+            logger.exception(
+                f"finger service: torque is off, but the servo position could "
+                f"not be read back: {exc!r}"
+            )
+            return None
 
     def _prepare_finger_service(self):
         """Lift the calibrated limits, set the service torque, drop calibration.
@@ -403,30 +386,30 @@ class Gripper:
         # written only on a change -- the same treatment, and for the same
         # reason, that ``_init_servo`` already gives the configuration
         # registers it writes. ``_calibrate`` writes them outright, which is
-        # fine there because it runs once per bring-up; here a close is a
-        # button an operator presses as many times as it takes to seat a
-        # finger, and each press would otherwise be three EEPROM writes of
-        # values that are already correct. ``torque_limit`` above is RAM and
-        # stays a plain write.
+        # fine there because it runs once per bring-up; an open drive may be
+        # stopped and started again more than once in one service session, and
+        # each start would otherwise be three EEPROM writes of values that are
+        # already correct. ``torque_limit`` above is RAM and stays a plain
+        # write.
         self._set_if_different(servo, "min_position_limit", 0)
         self._set_if_different(servo, "max_position_limit", self._POSITION_MAX)
         self._set_if_different(servo, "position_correction", 0)
         # Nothing the driver knows about position survives this: the fingers
-        # are about to leave the carriage, or arrive in it somewhere new. Said
-        # here rather than inferred later, so ~/gripper_state reports
-        # calibrated=False and goto_position refuses until a real rehome has
-        # happened.
+        # are about to leave the carriage. Said here rather than inferred
+        # later, so ~/gripper_state reports calibrated=False and goto_position
+        # refuses until a real rehome has happened.
         self._calibrated = False
 
     def _release_after_service(self, what):
         """Cut torque, and make a failure to do so impossible to miss.
 
-        Called from the ``finally`` of both service motions, so it runs on the
-        failure paths too -- which is exactly when the bus is most likely to be
-        the thing that failed. A release that fails must not replace the
-        original error (that one says what actually went wrong) and must not
-        pass silently either, because it means the motor is still driving
-        against a person. So: logged at error, loudly, and swallowed.
+        Called from the open drive's ``finally`` (so it runs on the failure
+        path too -- exactly when the bus is most likely to be the thing that
+        failed) and directly from the close release, which has no drive to
+        guard and nothing else to do. A release that fails must not replace an
+        original error in flight (that one says what actually went wrong) and
+        must not pass silently either, because it can mean the motor is still
+        driving against a person. So: logged at error, loudly, and swallowed.
 
         The exception's repr is in the MESSAGE as well, which ruff's TRY401
         calls redundant and which is not redundant here: the handler that

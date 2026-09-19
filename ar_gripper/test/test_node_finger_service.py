@@ -202,10 +202,12 @@ def test_open_true_then_false_leaves_the_fingers_slack(make_node, frozen_clock):
 
 
 def test_close_returns_promptly_with_the_fingers_slack(make_node):
+    """Nothing is driven, so this is a bus write and a read, not a wait."""
     from std_srvs.srv import Trigger
 
     node, fake, _saved = make_node(finger_service=True)
     gripper = _gripper(node)
+    fake.trace.clear()  # drop bring-up writes from node/gripper construction
 
     started = real_time.monotonic()
     response = gripper._handle_finger_service_close(
@@ -215,8 +217,9 @@ def test_close_returns_promptly_with_the_fingers_slack(make_node):
 
     assert response.success is True
     assert response.message
-    assert elapsed < 2.0
-    assert _writes(fake)[-1] == (TORQUE_SWITCH, [TORQUE_OFF])
+    assert elapsed < 0.5
+    assert _moved(fake) == []  # no goal, no re-reference -- the pinion is free
+    assert _writes(fake) == [(TORQUE_SWITCH, [TORQUE_OFF])]
 
 
 def test_close_is_refused_while_the_open_drive_is_running(make_node, frozen_clock):
@@ -256,11 +259,7 @@ def test_shutting_the_node_down_stops_a_drive_that_is_still_pushing(
 
 
 def test_shutdown_cuts_torque_even_when_stopping_the_drive_fails(make_node):
-    """The release must not depend on the stop having got as far as its own.
-
-    A close can also be in flight on another thread at shutdown, which
-    ``finger_service_open_stop`` knows nothing about.
-    """
+    """The release must not depend on the stop having got as far as its own."""
     node, fake, _saved = make_node(finger_service=True)
     gripper = _gripper(node)
 

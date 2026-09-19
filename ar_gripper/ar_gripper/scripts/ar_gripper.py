@@ -7,8 +7,6 @@ from threading import Lock, Thread
 from time import monotonic, sleep
 
 import rclpy
-from ar_gripper_interfaces.msg import GripperState
-from ar_gripper_interfaces.srv import SetHoldingTorque
 from control_msgs.action import GripperCommand
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rcl_interfaces.msg import ParameterDescriptor
@@ -30,6 +28,8 @@ from ar_gripper.feetech import USB2FeetechDevice
 from ar_gripper.gripper import CalibrationError
 from ar_gripper.helpers import ConnectPythonLoggingToROS
 from ar_gripper.standalone import ARGripperStandalone
+from ar_gripper_interfaces.msg import GripperState
+from ar_gripper_interfaces.srv import SetHoldingTorque
 
 #: Why a grasp or a calibration was turned down, and the one thing that undoes
 #: it. Said the same way by the action and by the calibrate service, because an
@@ -94,22 +94,23 @@ class ARGripper:
         self._finger_service_open_srv = None
         self._finger_service_close_srv = None
         if finger_service:
-            # Advertised ONLY in this mode. They move the fingers past the
-            # calibrated stop and leave the gripper uncalibrated, which is
-            # exactly right while it is being serviced and is a way to break a
-            # working gripper the rest of the time. A mode that has to be
-            # asked for is also the only thing that makes "nothing moved" true
-            # at startup, and that is the property the operator is relying on.
+            # Advertised ONLY in this mode. The open drive moves the fingers
+            # past the calibrated stop and leaves the gripper uncalibrated,
+            # which is exactly right while it is being serviced and is a way
+            # to break a working gripper the rest of the time; close instead
+            # just frees the pinion. A mode that has to be asked for is also
+            # the only thing that makes "nothing moved" true at startup, and
+            # that is the property the operator is relying on.
             #
             # Their own callback group, for the same reason the action server
-            # has one: finger_service_close occupies its callback for
-            # FINGER_SERVICE_CLOSE_S, and in the node's default
-            # MutuallyExclusiveCallbackGroup that would hold off the status,
-            # diagnostics and overload timers that share it -- the moment an
-            # operator is most likely to be watching /joint_states to see what
-            # the fingers are doing. One group for BOTH services rather than
-            # one each, so the two opposite motions cannot be commanded at the
-            # same time.
+            # has one: stopping the open drive can block its callback for up
+            # to _FINGER_SERVICE_JOIN_S joining the drive thread, and in the
+            # node's default MutuallyExclusiveCallbackGroup that would hold
+            # off the status, diagnostics and overload timers that share it --
+            # the moment an operator is most likely to be watching
+            # /joint_states to see what the fingers are doing. One group for
+            # BOTH services rather than one each, so the two opposite requests
+            # cannot be issued at the same time.
             self._finger_service_callback_group = MutuallyExclusiveCallbackGroup()
             self._finger_service_open_srv = self._node.create_service(
                 SetBool,
@@ -166,9 +167,10 @@ class ARGripper:
                 f"Gripper '{gripper_name}' is in FINGER-SERVICE mode: no startup "
                 "calibration, nothing has moved, and grasping and calibration are "
                 f"refused. Use ~/{gripper_name}/finger_service_open to drive the "
-                "fingers out past the open stop and "
-                f"~/{gripper_name}/finger_service_close to push new ones in, then "
-                "restart WITHOUT finger_service:=true to recalibrate."
+                "fingers out past the open stop, push new ones in by hand with the "
+                f"pinion free (call ~/{gripper_name}/finger_service_close if torque "
+                "is still on), then restart WITHOUT finger_service:=true to "
+                "recalibrate."
             )
         else:
             try:
@@ -252,12 +254,11 @@ class ARGripper:
         return response
 
     def _handle_finger_service_close(self, _request, response):
-        """One short, gentle push toward closed, so new fingers can be seated."""
+        """Free the pinion (torque off) so both fingers can be pushed in by hand."""
         gripper = self.gripper
         if gripper.finger_service_open_active:
-            # The two are opposite directions. Refused rather than queued
-            # behind the open drive, which has no end the operator has asked
-            # for yet.
+            # The two are opposite requests. Refused rather than queued behind
+            # the open drive, which has no end the operator has asked for yet.
             response.success = False
             response.message = (
                 "finger-service open drive is still running; send data: false to "
@@ -265,14 +266,16 @@ class ARGripper:
             )
             self._node.get_logger().warn(response.message)
             return response
-        before, after = gripper.finger_service_close()
+        position = gripper.finger_service_close()
         response.success = True
         response.message = (
-            f"closed for {gripper.FINGER_SERVICE_CLOSE_S:g} s at "
-            f"{gripper.FINGER_SERVICE_TORQUE:g}% torque, torque off; servo "
-            f"position was {before}, re-referenced to {gripper.RESET_POSITION} for "
-            f"the move and now reads {after} "
-            f"({after - gripper.RESET_POSITION:+d} ticks toward closed)"
+            "torque off; push the fingers in by hand, then restart without "
+            "finger_service to recalibrate"
+        )
+        response.message += (
+            " (the servo position could not be read back; see the log)"
+            if position is None
+            else f" (servo position {position})"
         )
         self._node.get_logger().info(response.message)
         return response
@@ -280,20 +283,22 @@ class ARGripper:
     def shutdown(self):
         """Stop anything this gripper is still doing on a thread of its own.
 
-        Only the finger-service drive: it is the one thing here that outlives
-        the call that started it, and Ctrl-C kills its daemon thread without
-        the servo ever hearing about it -- leaving the motor pushing, at the
-        one moment when a person's hands are most likely to be in the fingers.
+        Only the finger-service open drive: it is the one thing here that
+        outlives the call that started it, and Ctrl-C kills its daemon thread
+        without the servo ever hearing about it -- leaving the motor pushing,
+        at the one moment when a person's hands are most likely to be in the
+        fingers. Close has no thread of its own to stop; it cuts torque and
+        returns within its own service call.
 
         Deliberately NOT a blanket release. Outside finger-service mode the
         fingers may be holding something at shutdown, and cutting torque there
         would drop it.
 
         Inside the mode, though, the release is unconditional and does not
-        depend on the stop above it having got as far as its own: a close may
-        be in flight on another thread, which ``finger_service_open_stop``
-        knows nothing about, and the stop can itself fail on the bus. Nothing
-        here may raise -- this runs from ``destroy_node``, which has to finish.
+        depend on the stop above it having got as far as its own: that stop
+        can itself fail on the bus, and releasing again afterward costs
+        nothing when the pinion is already free. Nothing here may raise --
+        this runs from ``destroy_node``, which has to finish.
         """
         if not self._finger_service:
             return
@@ -602,10 +607,11 @@ class ARGripperNode(Node):
                     "check, and the saved position is never written. Grasping and "
                     "calibration are refused; two services are advertised instead "
                     "-- finger_service_open drives the fingers open past the "
-                    "calibrated stop so they can be pulled out of the carriage, "
-                    "finger_service_close closes gently for a moment so new ones "
-                    "can be pushed in. Restart without it afterwards and the "
-                    "normal startup calibration rehomes the gripper."
+                    "calibrated stop so they can be pulled out of the carriage; "
+                    "new ones go in by hand with the pinion free, and "
+                    "finger_service_close is there only to cut torque if it is "
+                    "still on. Restart without it afterwards and the normal "
+                    "startup calibration rehomes the gripper."
                 ),
                 read_only=True,
             ),

@@ -44,8 +44,11 @@ same instant.
 
 A finger that jams mid-close leaves the fingers stuck in the carriage and the
 position calibration wrong. Getting out of that needs the servo to keep driving
-toward open — past the calibrated open stop — while you pull the fingers out,
-and then to close gently for a moment while you push new ones in.
+toward open — past the calibrated open stop — while you pull the fingers out.
+The two fingers are racks on one pinion, so putting new ones back in needs the
+pinion free to turn while you push each one in by hand, not driven — a driven
+close only pushes the finger already engaged and cocks the other one against
+the carriage.
 
 Bring the driver up in finger-service mode. **Nothing moves at startup**: no
 calibration, no saved-position check, and the saved position is never written.
@@ -65,9 +68,9 @@ ros2 service call /ar_gripper/primary/finger_service_open std_srvs/srv/SetBool "
 ros2 service call /ar_gripper/primary/finger_service_open std_srvs/srv/SetBool "{data: false}"
 ```
 
-Push the new fingers in against a short, gentle close. Each call is one 1.5 s
-push at the calibration torque, after which torque comes off; call it as many
-times as it takes:
+Push both new fingers in by hand with the pinion free. Torque is already off
+once the open drive has stopped; call `finger_service_close` only if it is
+somehow still on:
 
 ```bash
 ros2 service call /ar_gripper/primary/finger_service_close std_srvs/srv/Trigger
@@ -100,17 +103,17 @@ from ar_gripper.standalone import ARGripperStandalone
 gripper = ARGripperStandalone(port="/dev/ttyUSB0", servo_id=1, name="primary")
 
 # Read state
-gripper.get_position("m")        # meters (0.0 closed .. 0.05 open)
+gripper.get_position("m")  # meters (0.0 closed .. 0.05 open)
 gripper.get_position("percent")  # 0 closed .. 100 open
-gripper.get_position("ticks")    # raw servo encoder ticks
-gripper.get_state()              # dict: position_m/pct/ticks, load, effort_N,
-                                 #       temperature, calibrated, moving
+gripper.get_position("ticks")  # raw servo encoder ticks
+gripper.get_state()  # dict: position_m/pct/ticks, load, effort_N,
+#       temperature, calibrated, moving
 
 # Discrete grasps (managed: waits for stall, applies holding torque)
 gripper.set_goal(0.02, unit="m", effort=300.0)  # effort in Newtons
 gripper.open()
 gripper.close()
-gripper.release()                # torque off
+gripper.release()  # torque off
 
 # Fast, non-blocking position control for a policy loop (raw ticks)
 gripper.write_goal_ticks(2048)
@@ -144,9 +147,9 @@ from ar_gripper.mock import mock_gripper
 
 with mock_gripper() as (gripper, bus):
     gripper.close()
-    assert gripper.get_position("ticks") > 4000   # closed
+    assert gripper.get_position("ticks") > 4000  # closed
     gripper.open()
-    assert gripper.get_position("ticks") < 200      # open
+    assert gripper.get_position("ticks") < 200  # open
     # bus.trace holds every servo packet that was written
 ```
 
