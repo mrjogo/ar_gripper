@@ -1,7 +1,8 @@
 """The fake servo's motor-current model, and the stall branch it makes reachable.
 
-``Gripper._goto_position`` applies holding torque when EITHER two consecutive current
-samples exceed 1.4x the baseline OR the servo reports it has stopped, and both are
+``Gripper._goto_position`` applies holding torque when EITHER, on a close, two
+consecutive current samples exceed 1.4x the baseline OR the servo reports it has
+stopped (an open waits for the stop alone), and both are
 checked in the same loop iteration -- so "a stall was detected" cannot be read off the
 return value. It is read off the wire instead: a stall fires while the servo is still
 reporting movement, so ``moving_sign`` reads follow the holding-torque write.
@@ -111,3 +112,53 @@ def test_calibrate_homes_against_an_obstruction(fake_serials, fast_clock):
     gripper = Gripper(device, "primary", SID)
     assert gripper.calibrate() is True
     assert gripper.calibrated is True
+
+
+class _CruiseThenSurge:
+    """A FakeServo whose current reads nominal for ``calm_reads`` reads, then 10x.
+
+    Nothing is in the way: the surge is current alone, which is exactly what the
+    stall test sees when its baseline was taken while the motor was still
+    accelerating. Built per test because FakeServo is imported lazily.
+    """
+
+    @staticmethod
+    def make(calm_reads, **kwargs):
+        from ar_gripper.mock import FakeServo
+
+        class Servo(FakeServo):
+            def __init__(self):
+                super().__init__(**kwargs)
+                self.current_reads = 0
+
+            def _current_ma(self):
+                self.current_reads += 1
+                nominal = super()._current_ma()
+                return nominal if self.current_reads <= calm_reads else 10 * nominal
+
+        return Servo()
+
+
+def _servo_with_surge(make_servo, start_ticks):
+    gripper, fake = make_servo(travel_ticks_per_read=20)
+    servo = _CruiseThenSurge.make(calm_reads=8, travel_ticks_per_read=20)
+    servo.present_position_value = start_ticks
+    servo._goal_value = start_ticks
+    fake.servos[SID] = servo
+    fake.trace.clear()
+    return gripper, fake
+
+
+def test_a_current_surge_while_closing_applies_holding_torque_mid_move(make_servo):
+    """Closing keeps its early drop: the surge lands before the fingers stop."""
+    gripper, fake = _servo_with_surge(make_servo, start_ticks=150)
+    assert gripper.goto_position(0, 100) is True
+    assert _moving_reads_after_holding_torque(fake.trace) > 0
+
+
+def test_a_current_surge_while_opening_keeps_full_torque_until_stopped(make_servo):
+    """The slow-open bug: an open used to finish at holding torque on a surge."""
+    gripper, fake = _servo_with_surge(make_servo, start_ticks=4000)
+    assert gripper.goto_position(100, 100) is True
+    assert gripper.servo.present_position == 150
+    assert _moving_reads_after_holding_torque(fake.trace) == 0
