@@ -612,6 +612,23 @@ class Gripper:
 
         with self._aborted_lock:
             self._aborted = False
+        # Closed is the HIGH-count side (_POSITION_MAX). Only a close watches the
+        # current. The fingers are compliant: on contact they compress like
+        # springs, and current climbs before they reach full stopping torque.
+        # Dropping to holding torque on that first rise is what keeps a
+        # full-torque close from jamming shut, so it has to stay early.
+        #
+        # An open has nothing to protect that way. What it did have was false
+        # triggers: the baseline is sampled 0.3 s in, while a long stroke from
+        # fully closed is still accelerating, so ordinary cruise current read as
+        # a stall, and the open finished at holding torque in about 10 s
+        # instead of about 2 s (a quarter of the opens from fully closed, in
+        # three days of robot logs). An open now keeps the commanded torque
+        # until the servo reports it has stopped, then holds, like any other
+        # move. Hitting something while opening is the planner's problem. The
+        # servo's own overload protection (_init_servo) still caps a blocked
+        # open after 300 ms.
+        closing = position > self.servo.present_position
         # Turn off the torque momentarily to prevent jerking and not apply new torque to
         # previous position
         self.servo.torque_enable = False
@@ -650,11 +667,18 @@ class Gripper:
                 current_stall_count += 1
             else:
                 current_stall_count = 0
-            # Apply holding torque if stall is detected or if motion has stopped
+            # Apply holding torque if a closing stall is detected or if motion has
+            # stopped
             stopped = not self.servo.moving_sign
-            if not holding_torque_applied and (
-                current_stall_count >= STALL_SAMPLES or stopped
-            ):
+            stalled = closing and current_stall_count >= STALL_SAMPLES
+            if not holding_torque_applied and (stalled or stopped):
+                logger.info(
+                    f"holding torque {holding_torque} applied while "
+                    f"{'closing' if closing else 'opening'} "
+                    f"({'current stall' if stalled else 'stopped'}) after "
+                    f"{deadline.elapsed():.2f} s: current {current:.1f} mA, "
+                    f"baseline {current_baseline:.1f} mA"
+                )
                 self.set_torque(holding_torque)
                 holding_torque_applied = True
 
